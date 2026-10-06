@@ -29,6 +29,7 @@ enum class PacketType : uint8_t {
     Command = 2,
     CommandAcknowledgment = 3,
     TimeSync = 4,
+    SensorTelemetry = 5,
 };
 
 enum class CommandType : uint8_t {
@@ -47,6 +48,13 @@ enum StatusFlag : uint8_t {
     QueuePending = 1 << 3,
 };
 
+enum SensorFlag : uint8_t {
+    AccelerometerPresent = 1 << 0,
+    MagnetometerPresent = 1 << 1,
+    AccelerometerValid = 1 << 2,
+    MagnetometerValid = 1 << 3,
+};
+
 struct __attribute__((packed)) Packet {
     uint8_t packetType;
     uint8_t senderId;
@@ -62,6 +70,26 @@ struct __attribute__((packed)) Packet {
 };
 
 static_assert(sizeof(Packet) == 20, "Antenna-controller packet size changed");
+
+struct __attribute__((packed)) SensorTelemetry {
+    uint8_t packetType;
+    uint8_t senderId;
+    uint8_t protocolVersion;
+    uint8_t flags;
+    uint32_t sequence;
+    int16_t magneticHeadingDeciDegrees;
+    int16_t magneticXDeciMicrotesla;
+    int16_t magneticYDeciMicrotesla;
+    int16_t magneticZDeciMicrotesla;
+    int16_t accelerationXMilliG;
+    int16_t accelerationYMilliG;
+    int16_t accelerationZMilliG;
+    int16_t rollDeciDegrees;
+    int16_t pitchDeciDegrees;
+};
+
+static_assert(sizeof(SensorTelemetry) == 26,
+              "Sensor-telemetry packet size changed");
 
 inline const uint8_t* antennaNodeMac(uint8_t nodeId) {
     switch (nodeId) {

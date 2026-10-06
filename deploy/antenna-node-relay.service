@@ -1,0 +1,20 @@
+[Unit]
+Description=Node 2 antenna-controller serial relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/antenna-controller
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/default/antenna-node-relay
+ExecStart=/opt/antenna-controller/.venv/bin/python -m antenna_controller relay --serial ${ANTENNA_NODE_SERIAL} --listen-host ${ANTENNA_RELAY_LISTEN_HOST} --listen-port 31995
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

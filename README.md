@@ -8,6 +8,45 @@ rotator-mounted Yagis. Its intended implementation comprises a Cheap Yellow
 Display (CYD) USB gateway and local operator console, two ESP32 antenna nodes
 connected over ESP-NOW, node firmware, and a host-side control adapter.
 
+## Development checkpoint — 2026-10-06 (before calibration)
+
+Recovered from session `01a10de7-c1c2-7c92-8e38-c253e108b109`.
+This snapshot preserves the v0.2 host application and sensor bring-up before
+the persistent-calibration increment.
+
+- Implemented: CYD/ESP-NOW gateway, two non-actuating rotator models,
+  node-2 LSM303AGR raw vectors, compact JSON serial, host TCP commands/UDP
+  state, optional Pi serial relay, and the Textual dashboard.
+- Latest completed work: serial reconnection and COM reassignment handling,
+  POSIX serial paths, configurable serial settings, `--scan-serial`, TUI
+  `SYSTEM` logging, and one `LOST`/`RESTORED` report per link transition.
+- Validation at recovery: all 13 Python tests pass and all three PlatformIO
+  targets build. The earlier session recorded direct node-2 sensor telemetry
+  and a same-PC forced-backup hardware smoke test passing. Automatic failover
+  and complete disconnect/reconnect behavior still need dedicated validation.
+- Last bench arrangement: node 2 powered separately and communicating through
+  CYD/ESP-NOW; the optional Pi relay was off. The recovery scan found CH340
+  on COM10 and no CP210x node. COM6/COM7 below are historical examples;
+  enumerate devices before connecting or uploading.
+- Calibration is not implemented at this checkpoint. The TUI's
+  `UNCALIBRATED` label is a placeholder, magnetic heading is diagnostic,
+  and rotator feedback remains simulated. No relay GPIO is assigned.
+
+The next authorized increment is guided sensor capture, fitting and
+validation, applying corrections on node 2, explicit save/clear commands,
+ESP32 Preferences/NVS persistence across power loss, and calibration status
+reported by the node to the TUI. The previous attempt stopped on tool failures
+before changing files or flashing firmware. The intended sensor mounting is
+a 60 cm non-ferrous extension behind the Yagi reflector; mounting alignment
+and a true-bearing reference must be established during installation.
+
+Separate review follow-ups remain: end-to-end command acknowledgment and
+duplicate suppression; host-to-CYD clock synchronization; independent sensor
+freshness and ordering across routes; explicit simulated/measured azimuth;
+stronger board identity and non-USB Linux reconnection; mounting-aware tilt;
+TUI graph-axis/log retention checks; and structured TCP errors when a command
+route is unavailable. Physical relay control is a later increment.
+
 ## Scope
 
 - CYD gateway/operator-console and antenna-node firmware
@@ -62,14 +101,14 @@ Build both with:
 & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run
 ```
 
-The current development-machine device mapping is expected to be CYD `COM8`
-(CH340) and antenna node `COM7` (CP210x). These ports are intentionally not
-stored in `platformio.ini`; use the appropriate port when uploading:
+The current two-board bench mapping is CYD `COM6` (CH340) and node 2 `COM7`
+(CP210x). Windows can reassign these ports, so they are intentionally not
+stored in `platformio.ini`; verify them with `pio device list` before uploading:
 
 ```powershell
-& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e cyd_gateway -t upload --upload-port COM8
-& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e antenna_node_1 -t upload --upload-port COM7
-& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e antenna_node_2 -t upload --upload-port COM9
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e cyd_gateway -t upload --upload-port COM6
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e antenna_node_2 -t upload --upload-port COM7
+# Flash node 1 with its verified port when it is connected.
 ```
 
 The peer MAC addresses and the fixed ESP-NOW channel used by this prototype
@@ -103,3 +142,98 @@ The next increment is reserved for the incoming hardware:
 Before enabling either interface, record the actual node-board pinout and
 mounting arrangement, add a hardware-abstraction layer with outputs disabled
 by default, and complete a bench test before connecting to a rotator.
+
+### Node 2 LSM303AGR bring-up
+
+Node 2 is configured for the Adafruit LSM303AGR on its default I2C bus:
+
+| Qwiic wire | Signal | ESP32 pin |
+|---|---|---|
+| Red | 3.3 V | `3V3` |
+| Black | Ground | `GND` |
+| Blue | SDA | `GPIO21` |
+| Yellow | SCL | `GPIO22` |
+
+The node samples acceleration and magnetic field at 10 Hz and sends a
+diagnostic packet once per second. The CYD home panel shows `Mag ...M` for
+node 2. The debug panel shows magnetic heading, `Bx/By/Bz` in microtesla,
+`Ax/Ay/Az` in g, field magnitude, roll, and pitch. USB serial output includes
+the same raw vectors.
+
+The displayed magnetic heading is intentionally marked `M`: it is an
+uncalibrated magnetic heading for bring-up only. It is not yet tilt
+compensated, corrected for local declination, or used by the rotator control
+loop.
+
+## Host Antenna Controller and backup relay
+
+The `antenna_controller` Python module can run in either of two roles:
+
+- `ac`: the Antenna Controller process on the RF Collection Desktop. It reads
+  compact JSON telemetry from the CYD, accepts `antenna_command` JSON lines on
+  TCP 31988, and publishes `antenna_state` datagrams on UDP 31989.
+- `relay`: the optional Raspberry Pi process beside node 2. It bridges TCP
+  31995 to node 2's USB serial port. Both node firmwares expose this same
+  backup serial interface.
+
+Create or synchronize the project environment:
+
+```powershell
+uv sync
+```
+
+For same-PC integration testing, start the node-2 relay and AC in separate
+terminals (replace the COM ports if Windows reassigned them):
+
+```powershell
+uv run python -m antenna_controller relay --serial COM7 --listen-host 127.0.0.1
+uv run python -m antenna_controller ac --serial COM6 --backup-host 127.0.0.1 --tui
+```
+
+Linux serial paths such as `/dev/ttyACM0`, `/dev/ttyUSB0`, and persistent
+`/dev/serial/by-id/...` paths are accepted directly. To inspect available
+devices without opening or resetting them:
+
+```bash
+uv run python -m antenna_controller --scan-serial
+```
+
+Both `ac` and `relay` accept `--baud`, `--data-bits`, `--parity`,
+`--stop-bits`, `--read-timeout`, `--write-timeout`, `--xonxoff`, `--rtscts`,
+and `--dsrdtr`. Defaults match the ESP32 firmware: 115200 baud, 8 data bits,
+no parity, 1 stop bit, and no flow control.
+
+The Textual TUI provides scrolling plots for antenna azimuth/target,
+`Bx/By/Bz`, `Ax/Ay/Az`, and directional ESP-NOW RSSI. Use `m` to cycle graph
+modes, `t` to cycle time windows, `n` to select nodes, `o` to allow or block
+external client commands, and `u` to focus the manual-command field. All
+selectors and the command entry are also mouse-accessible.
+
+The AC uses the CYD/ESP-NOW path by default. For node 2 it fails over to the
+Pi route when gateway telemetry is stale and backup telemetry is fresh.
+`--prefer-backup-node2` forces the backup route for a bench test. On the Pi,
+use `/dev/serial/by-id/...` rather than a changing `/dev/ttyUSB*` name.
+Serial links reopen automatically after disconnect or stale telemetry. On
+Windows, the process remembers each board's USB identity and follows it if
+the operating system assigns a different COM number after reconnection.
+Link warnings are routed to the Textual event pane as `SYSTEM` reports.
+Missing serial or Pi-relay links produce one `LOST` report and remain quiet
+until a `RESTORED` transition occurs.
+
+Example TUI commands are `goto 2 180`, `step 2 -10`, `stop 2`, and `status`.
+An ICD command can also be sent directly to TCP 31988 as newline-delimited
+JSON:
+
+```json
+{"message_type":"antenna_command","antenna":"REF","command":"go_to","target_az_deg":180.0}
+```
+
+The board serial format is compact newline-delimited JSON: `rc` is a command,
+`rp` is rotator status, `rs` is sensor telemetry, and `ra` is an acceptance or
+error response. Human-readable firmware diagnostics remain present and are
+ignored by the Python process.
+
+The Pi listener is unauthenticated and is intended only for the isolated
+rooftop data network. Bind it to the Pi's data-network address and restrict
+TCP 31995 at the host firewall before physical relay actuation is enabled.
+Example `systemd` units and environment files are in [`deploy`](deploy).

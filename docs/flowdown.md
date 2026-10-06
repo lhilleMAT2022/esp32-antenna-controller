@@ -18,3 +18,10 @@ system-engineering repository.
 The upstream documents remain authoritative. Any proposed change to these
 requirements or interfaces must be made through the FlightTest
 system-engineering change-request process.
+
+## Proposed ICD clarification
+
+Reserve TCP 31995 for the optional node-2 serial relay. It transports the same
+compact newline-delimited `rotator_command`/`rotator_packet` objects as the
+local CYD USB link. This is a redundant AC-to-node transport, not a new
+system-level message or software-item requirement.

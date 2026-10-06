@@ -2,23 +2,46 @@
 
 ## Status: Draft
 
-**Last updated:** 2026-09-28  
+**Last updated:** 2026-10-05
 **Parent:** [System specification](rotator-controller-system.md)
 
 ## Functional decomposition
 
 ```text
-USB serial ──> CYD command parser ──> ESP-NOW command ──> Node supervisor
-    │                    │                                     │
-    │                    ├──> time synchronization ────────────┤
-    │                    └──> CYD operator/debug/keypad panels  │
-    │                                                          ▼
-    └────────────────< status, ACK, RSSI <── Node status <─ Rotator model
+RM --TCP 31988--> Host AC --USB--> CYD --ESP-NOW--> Nodes 1 and 2
+                         |          ^                 |
+                         |          +---- status -----+
+                         |
+                         +--TCP 31995--> Pi relay --USB--> Node 2
+
+Host AC --UDP 31989--> RM / RF Collector / Report & Display
 ```
 
-The CYD is the sole radio gateway. It owns display state and a UTC offset
-derived from USB serial. Each node owns its command queue, virtual press state,
-rotator dynamics, and position state.
+The CYD is the primary radio gateway and owns display state. The Python host
+AC adapts the system ICD to the compact board protocol, merges telemetry from
+either path, selects one command route, and publishes system state. Each node
+owns its command queue, virtual press state, rotator dynamics, and position
+state. The Pi relay is transport-only and owns no control policy.
+
+## Host transport and routing
+
+TCP 31988 is the authoritative `antenna_command` input to AC. UDP 31989 carries
+periodic, loss-tolerant `antenna_state`. TCP 31995 is reserved for a
+newline-delimited compact-JSON stream between AC and the optional Pi relay.
+
+The command route is single-path:
+
+1. Node 1 always uses CYD/ESP-NOW.
+2. Node 2 normally uses CYD/ESP-NOW.
+3. Node 2 uses the Pi route when primary telemetry is older than 3.5 s and Pi
+   telemetry is fresh, or when `--prefer-backup-node2` is selected.
+4. Commands are not broadcast over both paths, preventing duplicate physical
+   button actions when relay actuation is introduced.
+
+The TCP relay is intentionally unauthenticated for bench work on the isolated
+rooftop network. Before relay actuation, bind it to the data-network interface,
+apply a host firewall rule, and add authenticated command origin/replay
+protection.
 
 ## Packet contract
 
@@ -39,6 +62,21 @@ All ESP-NOW traffic uses one packed, 20-byte `Packet` at protocol version 3.
 
 `N>G` on the CYD is its direct receive measurement. `G>N` is the node's
 reported measurement. Neither is a calibrated RF power measurement.
+
+## Serial JSON contract
+
+All three ESP32 targets retain human-readable diagnostics and additionally
+emit one compact JSON object per line:
+
+| Type | Direction | Purpose |
+|---|---|---|
+| `rc` | AC → CYD or node | `goto`, `stop`, `step`, `queue`, `overlap`, or `time` command |
+| `rp` | CYD or node → AC | Rotator status: node, sequence, UTC, heading, target, moving, error |
+| `rs` | CYD or node → AC | Sensor vector, field magnitude, magnetic heading, roll, pitch, validity flags |
+| `ra` | CYD or node → AC | Command syntax/acceptance result |
+
+The gateway tags forwarded telemetry `src:"espnow"`; a directly attached node
+tags it `src:"node_serial"`. The Pi passes objects unchanged.
 
 ## Node rotator model
 
@@ -80,6 +118,9 @@ press. This tiny modeled motion is intentional.
 | Node status | 1 Hz | Reports time-invalid until CYD sync |
 | CYD time sync | Every 3 s and after `TIME` | UTC invalid after a CYD reset |
 | Display refresh | On status/event change and each UTC second | Home panel selected |
+| Sensor sample | 10 Hz on node 2 | Diagnostic only |
+| Compact serial status | 1 Hz per attached node | Same values as ESP-NOW status |
+| Host AC backup freshness | 3.5 s | Primary route preferred |
 
 ## Key decisions
 
@@ -90,6 +131,8 @@ press. This tiny modeled motion is intentional.
 | Control display is default; diagnostic panel is selected | Keeps operation-focused data primary while retaining radio observability. |
 | XPT2046 four-point calibration plus serial analogs | Aura confirms the CYD touch controller is on separate VSPI pins 25/32/39/33 with IRQ 36. Calibration is persisted in Preferences and maps raw touch coordinates directly to the landscape UI. |
 | Model-only actuation | Prevents any inadvertent rotator or mains-related action during development. |
+| Pi is a transparent relay | Keeps control policy, ICD expansion, and failover selection in AC. |
+| Single command route | Avoids duplicate button operations across redundant links. |
 
 ## API verification notes
 

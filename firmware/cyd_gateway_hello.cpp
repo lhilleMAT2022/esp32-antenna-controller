@@ -9,6 +9,7 @@
 #include <stdarg.h>
 
 #include "espnow_smoke_config.h"
+#include "serial_json_protocol.h"
 
 namespace {
 using namespace antenna_controller;
@@ -18,9 +19,10 @@ constexpr uint32_t SerialBaudRate = 115200;
 constexpr uint8_t ReceiveQueueSize = 8;
 constexpr uint32_t RssiFreshnessMs = 10000;
 constexpr uint32_t NodeOfflineMs = 5000;
-constexpr uint8_t EventLogLineCount = 8;
+constexpr uint32_t SensorOfflineMs = 3000;
+constexpr uint8_t EventLogLineCount = 4;
 constexpr uint8_t EventLogLineLength = 42;
-constexpr uint8_t SerialLineLength = 96;
+constexpr uint8_t SerialLineLength = 192;
 constexpr int HeaderDebugButtonX = 88;
 constexpr int HeaderDebugButtonWidth = 42;
 constexpr uint8_t TouchIrqPin = 36;
@@ -37,7 +39,8 @@ SPIClass touchscreenSpi(VSPI);
 XPT2046_Touchscreen touchscreen(TouchCsPin, TouchIrqPin);
 
 struct ReceivedPacket {
-    Packet packet;
+    uint8_t payload[sizeof(SensorTelemetry)];
+    uint8_t payloadLength;
     uint8_t sourceMac[6];
 };
 
@@ -49,6 +52,17 @@ struct NodeStatus {
     int8_t rssiAtNode = RssiUnavailable;
     uint32_t lastHeardMs = 0;
     uint32_t nodeEpochSeconds = 0;
+    uint8_t sensorFlags = 0;
+    int16_t magneticHeadingDeciDegrees = NoAzimuthDeciDegrees;
+    int16_t magneticXDeciMicrotesla = 0;
+    int16_t magneticYDeciMicrotesla = 0;
+    int16_t magneticZDeciMicrotesla = 0;
+    int16_t accelerationXMilliG = 0;
+    int16_t accelerationYMilliG = 0;
+    int16_t accelerationZMilliG = 0;
+    int16_t rollDeciDegrees = 0;
+    int16_t pitchDeciDegrees = 0;
+    uint32_t lastSensorMs = 0;
 };
 
 ReceivedPacket receiveQueue[ReceiveQueueSize]{};
@@ -113,6 +127,12 @@ bool macMatches(const uint8_t* first, const uint8_t* second) {
 bool nodeOnline(uint8_t nodeId) {
     const int index = nodeIndex(nodeId);
     return index >= 0 && millis() - nodeStatus[index].lastHeardMs < NodeOfflineMs;
+}
+
+bool sensorTelemetryFresh(uint8_t nodeId) {
+    const int index = nodeIndex(nodeId);
+    return index >= 0 && nodeStatus[index].lastSensorMs != 0 &&
+           millis() - nodeStatus[index].lastSensorMs < SensorOfflineMs;
 }
 
 uint32_t epochNow() {
@@ -236,6 +256,7 @@ void drawNodeCard(uint8_t nodeId, int y) {
     const int buttonY = y + 72;
     char azimuth[12];
     char target[12];
+    char magneticHeading[12];
     char line[34];
 
     display.fillRoundRect(4, y, screenWidth() - 8, cardHeight, 6,
@@ -256,8 +277,20 @@ void drawNodeCard(uint8_t nodeId, int y) {
              azimuthText(status.azimuthDeciDegrees, azimuth, sizeof(azimuth)));
     display.drawString(line, 10, y + 23, 4);
     display.setTextColor(TFT_WHITE, online ? TFT_DARKGREY : TFT_MAROON);
-    snprintf(line, sizeof(line), "Target %s",
-             azimuthText(status.targetDeciDegrees, target, sizeof(target)));
+    if (sensorTelemetryFresh(nodeId) &&
+        (status.sensorFlags & SensorFlag::MagnetometerValid) != 0) {
+        snprintf(line, sizeof(line), "Target %s  Mag %s",
+                 azimuthText(status.targetDeciDegrees, target, sizeof(target)),
+                 azimuthText(status.magneticHeadingDeciDegrees,
+                             magneticHeading, sizeof(magneticHeading)));
+        const size_t length = strlen(line);
+        if (length > 0 && line[length - 1] == 'T') {
+            line[length - 1] = 'M';
+        }
+    } else {
+        snprintf(line, sizeof(line), "Target %s",
+                 azimuthText(status.targetDeciDegrees, target, sizeof(target)));
+    }
     display.drawString(line, 10, y + 52, 2);
 
     drawButton(10, buttonY, 88, 22, "-10", TFT_BLUE);
@@ -303,7 +336,7 @@ void drawKeypadPanel() {
 void drawDebugPanel() {
     display.fillScreen(TFT_BLACK);
     drawHeader("DEBUG DIAGNOSTICS");
-    display.setTextColor(TFT_GREEN, TFT_BLACK);
+    display.setTextColor(TFT_SKYBLUE, TFT_BLACK);
     display.drawString("Link RSSI / model status", 4, 29, 2);
     for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
         const NodeStatus& status = nodeStatus[nodeIndex(nodeId)];
@@ -318,13 +351,44 @@ void drawDebugPanel() {
         display.setTextColor(TFT_WHITE, TFT_BLACK);
         display.drawString(row, 4, 51 + (nodeId - 1) * 19, 2);
     }
+
+    const NodeStatus& sensor = nodeStatus[nodeIndex(2)];
+    if (sensorTelemetryFresh(2)) {
+        const float bx = sensor.magneticXDeciMicrotesla / 10.0F;
+        const float by = sensor.magneticYDeciMicrotesla / 10.0F;
+        const float bz = sensor.magneticZDeciMicrotesla / 10.0F;
+        const float ax = sensor.accelerationXMilliG / 1000.0F;
+        const float ay = sensor.accelerationYMilliG / 1000.0F;
+        const float az = sensor.accelerationZMilliG / 1000.0F;
+        const float magnitude = sqrtf(bx * bx + by * by + bz * bz);
+        char row[52];
+        snprintf(row, sizeof(row), "N2 Mag %.1fM  |B| %.1fuT",
+                 sensor.magneticHeadingDeciDegrees / 10.0F,
+                 magnitude);
+        display.setTextColor(TFT_MAGENTA, TFT_BLACK);
+        display.drawString(row, 4, 89, 2);
+        snprintf(row, sizeof(row), "B x%+.1f y%+.1f z%+.1f uT", bx, by, bz);
+        display.setTextColor(TFT_CYAN, TFT_BLACK);
+        display.drawString(row, 4, 106, 2);
+        snprintf(row, sizeof(row), "A x%+.3f y%+.3f z%+.3f g", ax, ay, az);
+        display.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+        display.drawString(row, 4, 123, 2);
+        snprintf(row, sizeof(row), "Tilt roll %+.1f pitch %+.1f deg",
+                 sensor.rollDeciDegrees / 10.0F,
+                 sensor.pitchDeciDegrees / 10.0F);
+        display.drawString(row, 4, 140, 2);
+    } else {
+        display.setTextColor(TFT_ORANGE, TFT_BLACK);
+        display.drawString("N2 LSM303AGR: no valid data", 4, 89, 2);
+    }
+
     display.setTextColor(TFT_YELLOW, TFT_BLACK);
-    display.drawString("Event log", 4, 94, 2);
-    display.drawFastHLine(0, 112, screenWidth(), TFT_DARKGREY);
+    display.drawString("Event log", 4, 160, 2);
+    display.drawFastHLine(0, 177, screenWidth(), TFT_DARKGREY);
     display.setTextColor(TFT_CYAN, TFT_BLACK);
     for (int line = 0; line < EventLogLineCount; ++line) {
         if (eventLog[line][0] != '\0') {
-            display.drawString(eventLog[line], 4, 116 + line * 15, 2);
+            display.drawString(eventLog[line], 4, 181 + line * 15, 2);
         }
     }
 }
@@ -386,7 +450,8 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
 void onDataReceived(const uint8_t* sourceMac,
                     const uint8_t* data,
                     int dataLength) {
-    if (dataLength != sizeof(Packet)) {
+    if (dataLength != sizeof(Packet) &&
+        dataLength != sizeof(SensorTelemetry)) {
         return;
     }
     const uint8_t nextWriteIndex =
@@ -395,7 +460,8 @@ void onDataReceived(const uint8_t* sourceMac,
         return;
     }
     ReceivedPacket& received = receiveQueue[receiveQueueWriteIndex];
-    memcpy(&received.packet, data, sizeof(Packet));
+    memcpy(received.payload, data, dataLength);
+    received.payloadLength = static_cast<uint8_t>(dataLength);
     memcpy(received.sourceMac, sourceMac, sizeof(received.sourceMac));
     receiveQueueWriteIndex = nextWriteIndex;
 }
@@ -474,12 +540,110 @@ void sendCommand(uint8_t nodeId,
     appendEvent("TX N%u cmd %u", nodeId, static_cast<uint8_t>(command));
 }
 
+void emitStatusJson(const Packet& packet) {
+    Serial.printf(
+        "{\"t\":\"rp\",\"n\":%u,\"q\":%lu,\"ts\":%lu,\"h\":%.1f,"
+        "\"tg\":",
+        packet.senderId, static_cast<unsigned long>(packet.sequence),
+        static_cast<unsigned long>(packet.epochSeconds),
+        packet.azimuthDeciDegrees / 10.0F);
+    if (packet.targetDeciDegrees == NoAzimuthDeciDegrees) {
+        Serial.print("null");
+    } else {
+        Serial.printf("%.1f", packet.targetDeciDegrees / 10.0F);
+    }
+    Serial.printf(
+        ",\"mv\":%u,\"e\":0,\"ack\":%u,\"rg\":%d,\"rn\":%d,"
+        "\"src\":\"espnow\"}\n",
+        hasFlag(packet.flags, StatusFlag::Moving) ? 1U : 0U,
+        packet.packetType ==
+                static_cast<uint8_t>(PacketType::CommandAcknowledgment)
+            ? static_cast<unsigned int>(packet.commandType)
+            : 0U,
+        latestRssiForNode(packet.senderId), packet.receiverRssiDbm);
+}
+
+void emitSensorJson(const SensorTelemetry& telemetry) {
+    const float x = telemetry.magneticXDeciMicrotesla / 10.0F;
+    const float y = telemetry.magneticYDeciMicrotesla / 10.0F;
+    const float z = telemetry.magneticZDeciMicrotesla / 10.0F;
+    Serial.printf(
+        "{\"t\":\"rs\",\"n\":%u,\"q\":%lu,\"mh\":%.1f,"
+        "\"m\":[%.1f,%.1f,%.1f],\"a\":[%.3f,%.3f,%.3f],"
+        "\"f\":%.1f,\"r\":%.1f,\"p\":%.1f,\"sf\":%u,"
+        "\"src\":\"espnow\"}\n",
+        telemetry.senderId, static_cast<unsigned long>(telemetry.sequence),
+        telemetry.magneticHeadingDeciDegrees / 10.0F, x, y, z,
+        telemetry.accelerationXMilliG / 1000.0F,
+        telemetry.accelerationYMilliG / 1000.0F,
+        telemetry.accelerationZMilliG / 1000.0F,
+        sqrtf(x * x + y * y + z * z),
+        telemetry.rollDeciDegrees / 10.0F,
+        telemetry.pitchDeciDegrees / 10.0F, telemetry.flags);
+}
+
 void processReceivedPackets() {
     while (receiveQueueReadIndex != receiveQueueWriteIndex) {
         const ReceivedPacket received = receiveQueue[receiveQueueReadIndex];
         receiveQueueReadIndex =
             (receiveQueueReadIndex + 1) % ReceiveQueueSize;
-        const Packet& packet = received.packet;
+
+        if (received.payloadLength == sizeof(SensorTelemetry)) {
+            SensorTelemetry telemetry{};
+            memcpy(&telemetry, received.payload, sizeof(telemetry));
+            const int sensorIndex = nodeIndex(telemetry.senderId);
+            if (telemetry.packetType !=
+                    static_cast<uint8_t>(PacketType::SensorTelemetry) ||
+                telemetry.protocolVersion != ProtocolVersion ||
+                sensorIndex < 0 ||
+                !macMatches(received.sourceMac,
+                            antennaNodeMac(telemetry.senderId))) {
+                continue;
+            }
+
+            NodeStatus& sensorStatus = nodeStatus[sensorIndex];
+            sensorStatus.sensorFlags = telemetry.flags;
+            sensorStatus.magneticHeadingDeciDegrees =
+                telemetry.magneticHeadingDeciDegrees;
+            sensorStatus.magneticXDeciMicrotesla =
+                telemetry.magneticXDeciMicrotesla;
+            sensorStatus.magneticYDeciMicrotesla =
+                telemetry.magneticYDeciMicrotesla;
+            sensorStatus.magneticZDeciMicrotesla =
+                telemetry.magneticZDeciMicrotesla;
+            sensorStatus.accelerationXMilliG = telemetry.accelerationXMilliG;
+            sensorStatus.accelerationYMilliG = telemetry.accelerationYMilliG;
+            sensorStatus.accelerationZMilliG = telemetry.accelerationZMilliG;
+            sensorStatus.rollDeciDegrees = telemetry.rollDeciDegrees;
+            sensorStatus.pitchDeciDegrees = telemetry.pitchDeciDegrees;
+            sensorStatus.lastSensorMs = millis();
+
+            const float x = telemetry.magneticXDeciMicrotesla / 10.0F;
+            const float y = telemetry.magneticYDeciMicrotesla / 10.0F;
+            const float z = telemetry.magneticZDeciMicrotesla / 10.0F;
+            Serial.printf(
+                "SENSOR N%u flags=0x%02X heading=%.1fM "
+                "mag=(%.1f,%.1f,%.1f)uT accel=(%.3f,%.3f,%.3f)g "
+                "roll=%.1f pitch=%.1f\n",
+                telemetry.senderId, telemetry.flags,
+                telemetry.magneticHeadingDeciDegrees / 10.0F, x, y, z,
+                telemetry.accelerationXMilliG / 1000.0F,
+                telemetry.accelerationYMilliG / 1000.0F,
+                telemetry.accelerationZMilliG / 1000.0F,
+                telemetry.rollDeciDegrees / 10.0F,
+                telemetry.pitchDeciDegrees / 10.0F);
+            emitSensorJson(telemetry);
+
+            if (activePanel == Panel::Home) {
+                nodeCardDirty[sensorIndex] = true;
+            } else if (activePanel == Panel::Debug) {
+                debugDirty = true;
+            }
+            continue;
+        }
+
+        Packet packet{};
+        memcpy(&packet, received.payload, sizeof(packet));
         const int index = nodeIndex(packet.senderId);
         if (packet.protocolVersion != ProtocolVersion || index < 0 ||
             !macMatches(received.sourceMac, antennaNodeMac(packet.senderId))) {
@@ -514,6 +678,7 @@ void processReceivedPackets() {
                           ? -1.0F
                           : packet.targetDeciDegrees / 10.0F,
                       packet.flags);
+        emitStatusJson(packet);
         if (activePanel == Panel::Home) {
             nodeCardDirty[index] = true;
         } else if (activePanel == Panel::Debug) {
@@ -578,6 +743,22 @@ void printStatus() {
                           ? -1.0F
                           : status.targetDeciDegrees / 10.0F,
                       status.flags);
+        if (sensorTelemetryFresh(nodeId)) {
+            Serial.printf(
+                "  sensor flags=0x%02X heading=%.1fM "
+                "mag=(%.1f,%.1f,%.1f)uT accel=(%.3f,%.3f,%.3f)g "
+                "roll=%.1f pitch=%.1f\n",
+                status.sensorFlags,
+                status.magneticHeadingDeciDegrees / 10.0F,
+                status.magneticXDeciMicrotesla / 10.0F,
+                status.magneticYDeciMicrotesla / 10.0F,
+                status.magneticZDeciMicrotesla / 10.0F,
+                status.accelerationXMilliG / 1000.0F,
+                status.accelerationYMilliG / 1000.0F,
+                status.accelerationZMilliG / 1000.0F,
+                status.rollDeciDegrees / 10.0F,
+                status.pitchDeciDegrees / 10.0F);
+        }
     }
 }
 
@@ -616,6 +797,32 @@ void keypadKey(const char* key) {
 }
 
 void handleSerialLine(char* line) {
+    if (line[0] == '{') {
+        SerialRotatorCommand serialCommand{};
+        if (!parseSerialRotatorCommand(line, &serialCommand)) {
+            Serial.println(
+                "{\"t\":\"ra\",\"e\":1,\"detail\":\"invalid command\"}");
+            return;
+        }
+        if (serialCommand.command == CommandType::None) {
+            setEpoch(serialCommand.executeAtEpochSeconds);
+            sendTimeSync();
+        } else {
+            sendCommand(
+                serialCommand.nodeId, serialCommand.command,
+                static_cast<int16_t>(
+                    lroundf(serialCommand.valueDegrees * 10.0F)),
+                serialCommand.executeAtEpochSeconds);
+        }
+        Serial.printf(
+            "{\"t\":\"ra\",\"n\":%u,\"q\":%lu,\"c\":\"%s\","
+            "\"e\":0,\"detail\":\"accepted by gateway\","
+            "\"src\":\"gateway_serial\"}\n",
+            serialCommand.nodeId,
+            static_cast<unsigned long>(serialCommand.sequence),
+            serialCommandName(serialCommand.command));
+        return;
+    }
     char keyword[16]{};
     sscanf(line, "%15s", keyword);
     if (strcmp(keyword, "HELP") == 0) {

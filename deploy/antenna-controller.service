@@ -1,0 +1,20 @@
+[Unit]
+Description=Passive-radar Antenna Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/antenna-controller
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/default/antenna-controller
+ExecStart=/opt/antenna-controller/.venv/bin/python -m antenna_controller ac --serial ${AC_SERIAL_PORT} --command-host ${AC_COMMAND_HOST} --state-host ${AC_STATE_HOST} --backup-host ${AC_BACKUP_HOST}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

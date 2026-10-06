@@ -2,7 +2,7 @@
 
 ## Status: In Progress
 
-**Last updated:** 2026-09-28  
+**Last updated:** 2026-10-05
 **Architecture:** [rotator-controller-architecture.md](rotator-controller-architecture.md)  
 **Test plan:** [rotator-controller-test-plan.md](rotator-controller-test-plan.md)
 
@@ -14,7 +14,8 @@
 | 1 — Node model | Complete | Non-actuating real-time plant, queue and status |
 | 2 — CYD mock-up | Complete | Default operator display, keypad/debug panels and USB commands |
 | 3 — Hardware smoke test | Complete | Build, flash and verify all three boards |
-| 4 — Physical integration | Next | Magnetometer, isolated relay interface, calibrated touch, encryption |
+| 4 — Physical integration | In progress | Magnetometer bring-up; isolated relay interface and encryption remain |
+| 4a — Redundant communications | In progress | Machine JSON serial, host AC, Pi relay, TCP 31995 failover |
 
 ## Parameters
 
@@ -45,3 +46,14 @@ disabled-by-default hardware-abstraction interfaces. Validate raw sensor
 telemetry and a disconnected relay bench fixture before allowing either
 interface to affect the rotator control path. Preserve the v0.1 plant model
 as the selectable fallback for regression testing and safe development.
+
+The first phase-4 increment enables the LSM303AGR on node 2 for diagnostic
+telemetry only. It does not replace the simulated azimuth feedback until
+mounting orientation, calibration, tilt compensation, and true-north
+correction have been verified.
+
+The communications increment adds direct JSON serial reporting to both nodes,
+the host AC adapter on TCP 31988/UDP 31989, and the optional Pi relay on TCP
+31995. Bench validation must prove primary routing, forced backup routing,
+stale-primary failover, and direct sensor reporting before any relay GPIO is
+assigned.

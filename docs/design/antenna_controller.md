@@ -227,3 +227,36 @@ The incoming parts define that next increment:
 No 120 VAC switching is in scope for this increment. Any later power-control
 node remains a low-voltage controller for an approved external switching
 device.
+
+### LSM303AGR bring-up status
+
+Node 2 enables the LSM303AGR accelerometer and LIS2MDL magnetometer on
+`GPIO21` (SDA) and `GPIO22` (SCL). It reports sensor presence, raw acceleration,
+raw magnetic field, field magnitude, roll, pitch, and a provisional magnetic
+heading to the CYD and both USB serial consoles.
+
+This first increment deliberately keeps sensor heading separate from the
+simulated control azimuth. The magnetic heading is uncalibrated and not tilt
+compensated; it must not drive a physical rotator. The next steps are to verify
+axis signs and mounting orientation, collect full-rotation calibration data,
+apply hard-/soft-iron correction and local magnetic declination, then validate
+true heading before selecting the sensor as the controller feedback source.
+
+### Redundant host communications
+
+The host-side Python Antenna Controller is the adapter between the system ICD
+and the ESP32 network. Its primary path is USB serial to the CYD followed by
+ESP-NOW to either remote node. Node 2 also supports an optional backup path
+over the rooftop Ethernet network to a Raspberry Pi, then USB serial directly
+to node 2.
+
+The AC listens for `antenna_command` on TCP 31988 and publishes
+`antenna_state` on UDP 31989. The Pi serial relay listens on TCP 31995 and
+passes compact newline-delimited JSON without making control decisions. AC
+prefers the CYD path, uses only one command path at a time, and fails node 2
+over only when primary telemetry is stale or a bench-test override is set.
+
+This transport is development-only and unauthenticated. Before the physical
+relay output can be enabled, TCP 31995 must be restricted to the isolated
+data-network interface/firewall and command replay/authentication controls
+must be added.
