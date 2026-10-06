@@ -23,6 +23,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .calibration import CalibrationManager
+
 LOGGER = logging.getLogger("antenna_controller")
 SERIAL_BAUD = 115200
 AC_COMMAND_PORT = 31988
@@ -54,6 +56,8 @@ def parse_board_line(line: str | bytes) -> dict[str, Any] | None:
         "rs",
         "ra",
         "rc",
+        "cc",
+        "cs",
     }:
         return None
     return message
@@ -628,6 +632,7 @@ class AntennaController:
         self._events_lock = threading.Lock()
         self._client_count = 0
         self._client_lock = threading.Lock()
+        self.calibration = CalibrationManager(self._send_calibration, self._report_calibration)
         self._stop = threading.Event()
         self._server = self._make_command_server(command_host, command_port)
         self._server_thread = threading.Thread(
@@ -728,6 +733,9 @@ class AntennaController:
     def _handle_board_message(
         self, message: dict[str, Any], route: str
     ) -> None:
+        self.calibration.ingest(message)
+        if message.get("t") == "cs":
+            return
         if message.get("t") == "ra":
             LOGGER.info("board response via %s: %s", route, message)
             self._record_event(
@@ -824,6 +832,15 @@ class AntennaController:
         if node_id == 2 and backup_ready:
             return "backup", self.backup
         raise RuntimeError(f"no command route available for node {node_id}")
+
+    def _send_calibration(self, node_id: int, message: dict[str, Any]) -> str:
+        route, endpoint = self._select_route(node_id)
+        if not endpoint.send(message):
+            raise RuntimeError(f"{route} calibration write failed")
+        return route
+
+    def _report_calibration(self, node_id: int, detail: str) -> None:
+        self._record_event("CALIBRATION", detail, source=f"node{node_id}", route="calibration")
 
     def _send_rotator_command(
         self,
@@ -1004,13 +1021,13 @@ class PiSerialRelay:
             def handle(self) -> None:
                 for raw in self.rfile:
                     message = parse_board_line(raw)
-                    if message is None or message.get("t") != "rc":
+                    if message is None or message.get("t") not in {"rc", "cc"}:
                         self.wfile.write(
                             json_line(
                                 {
                                     "t": "ra",
                                     "e": 1,
-                                    "detail": "expected compact rc JSON",
+                                    "detail": "expected compact rc or cc JSON",
                                 }
                             )
                         )

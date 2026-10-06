@@ -45,7 +45,9 @@ protection.
 
 ## Packet contract
 
-All ESP-NOW traffic uses one packed, 20-byte `Packet` at protocol version 3.
+Protocol version 3 uses a packed 20-byte rotator `Packet` and a separate
+26-byte raw `SensorTelemetry` packet. The calibration increment adds 56-byte
+commands (type 6) and 52-byte reports (type 7), preserving existing layouts.
 
 | Field | Unit | Meaning |
 |---|---|---|
@@ -74,9 +76,17 @@ emit one compact JSON object per line:
 | `rp` | CYD or node → AC | Rotator status: node, sequence, UTC, heading, target, moving, error |
 | `rs` | CYD or node → AC | Sensor vector, field magnitude, magnetic heading, roll, pitch, validity flags |
 | `ra` | CYD or node → AC | Command syntax/acceptance result |
+| `cc` | AC → CYD or node | Calibration apply, mounting, save, clear, or status command |
+| `cs` | Node → AC via either route | Boot ID, request acknowledgment, calibration flags and corrected diagnostics |
 
 The gateway tags forwarded telemetry `src:"espnow"`; a directly attached node
 tags it `src:"node_serial"`. The Pi passes objects unchanged.
+
+Calibration fitting runs on the host; coefficients are validated and applied
+on the node. An explicit save commits a versioned, integrity-checked NVS blob.
+Calibration request IDs survive both hops and only node responses confirm
+completion. See [calibration](../../../calibration.md) for packet fields,
+fitting constraints, persistence behavior, and the operator procedure.
 
 ## Node rotator model
 

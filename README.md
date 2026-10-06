@@ -12,7 +12,7 @@ connected over ESP-NOW, node firmware, and a host-side control adapter.
 
 Recovered from session `01a10de7-c1c2-7c92-8e38-c253e108b109`.
 This snapshot preserves the v0.2 host application and sensor bring-up before
-the persistent-calibration increment.
+the persistent-calibration increment; committed as `e630a6e`.
 
 - Implemented: CYD/ESP-NOW gateway, two non-actuating rotator models,
   node-2 LSM303AGR raw vectors, compact JSON serial, host TCP commands/UDP
@@ -46,6 +46,28 @@ freshness and ordering across routes; explicit simulated/measured azimuth;
 stronger board identity and non-USB Linux reconnection; mounting-aware tilt;
 TUI graph-axis/log retention checks; and structured TCP errors when a command
 route is unavailable. Physical relay control is a later increment.
+
+## Persistent calibration increment
+
+The calibration software now provides guided host capture, 3-D magnetometer
+fitting, six-face accelerometer fitting, mounting-axis/declination setup, and
+node-confirmed apply/save/clear operations through CYD or the optional relay.
+Node 2 stores a validated, versioned calibration record in ESP32 NVS and
+reloads it at boot. Raw vectors remain available and rotator feedback remains
+simulated. Physical capture and power-cycle acceptance are still pending.
+
+Verification on 2026-10-06: 25 host/native tests pass, all three firmware
+targets build, and the CYD (COM10) and node 2 (COM7) have been flashed.
+Live calibration status and invalid-coefficient rejection passed over direct
+USB and CYD/ESP-NOW. Host AC received node-confirmed status through both its
+primary route and the same-PC Pi-style relay. No calibration was applied or
+saved during these checks. Git origin is configured; commits remain local.
+
+Update the CYD and node-2 firmware together, synchronize the Python environment
+with `uv sync --inexact`, and press `c` or click **Cal** in the TUI. Follow the
+[calibration procedure](docs/calibration.md) for capture, validation, explicit
+saving, and the hardware acceptance checks. The checkpoint above records the
+state before this increment.
 
 ## Scope
 
@@ -82,6 +104,7 @@ component design and implementation.
 - commit: `48fec02bedbc4baec964797dd225ec2314383712`
 - original path: `TestSetupTesting/antenna_controller.md`
 
+The project origin is `https://github.com/lhilleMAT2022/esp32-antenna-controller.git`.
 No FlightTest Git remote is configured for this repository.
 
 ## Firmware v0.1: control-panel and rotator-model prototype
@@ -160,10 +183,10 @@ node 2. The debug panel shows magnetic heading, `Bx/By/Bz` in microtesla,
 `Ax/Ay/Az` in g, field magnitude, roll, and pitch. USB serial output includes
 the same raw vectors.
 
-The displayed magnetic heading is intentionally marked `M`: it is an
-uncalibrated magnetic heading for bring-up only. It is not yet tilt
-compensated, corrected for local declination, or used by the rotator control
-loop.
+The CYD magnetic heading marked `M` remains a raw diagnostic. The calibration
+increment supplies a separate corrected, tilt-compensated true heading after
+sensor calibration and mounting/declination setup. Neither replaces the
+simulated rotator feedback yet; see [calibration](docs/calibration.md).
 
 ## Host Antenna Controller and backup relay
 

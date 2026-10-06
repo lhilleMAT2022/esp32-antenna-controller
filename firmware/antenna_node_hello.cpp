@@ -3,6 +3,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <math.h>
+#include <Preferences.h>
 
 #ifdef ANTENNA_NODE_HAS_LSM303AGR
 #include <Adafruit_LIS2MDL.h>
@@ -12,6 +13,7 @@
 
 #include "espnow_smoke_config.h"
 #include "serial_json_protocol.h"
+#include "calibration_protocol.h"
 
 #ifndef ANTENNA_NODE_ID
 #error "ANTENNA_NODE_ID must be defined by the PlatformIO environment"
@@ -31,7 +33,7 @@ constexpr float MechanicalTravelDeg = 370.0F;
 constexpr float PositionToleranceDeg = 0.5F;
 constexpr uint32_t DirectionTogglePressMs = 100;
 constexpr uint8_t NodeId = ANTENNA_NODE_ID;
-constexpr uint8_t SerialLineLength = 192;
+constexpr size_t SerialLineLength = 768;
 
 #ifdef ANTENNA_NODE_HAS_LSM303AGR
 constexpr uint8_t SensorSdaPin = 21;
@@ -58,7 +60,8 @@ float pitchDeg = 0.0F;
 #endif
 
 struct ReceivedPacket {
-    Packet packet;
+    uint8_t payload[sizeof(CalibrationCommand)];
+    uint8_t length;
 };
 
 struct ScheduledCommand {
@@ -89,7 +92,12 @@ bool directionToggleInProgress = false;
 uint32_t togglePressReleaseMs = 0;
 uint32_t lastModelUpdateMs = 0;
 char serialLine[SerialLineLength]{};
-uint8_t serialLineLength = 0;
+size_t serialLineLength = 0;
+bool serialLineOverflow = false;
+CalibrationConfig calibration = defaultCalibration();
+bool calibrationSaved = false;
+bool calibrationStorageInvalid = false;
+uint32_t calibrationBoot = 0;
 
 bool macMatches(const uint8_t* first, const uint8_t* second) {
     return memcmp(first, second, 6) == 0;
@@ -216,8 +224,9 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
                   status == ESP_NOW_SEND_SUCCESS ? "ok" : "failed");
 }
 
-void onDataReceived(const uint8_t*, const uint8_t* data, int dataLength) {
-    if (dataLength != sizeof(Packet)) {
+void onDataReceived(const uint8_t* source, const uint8_t* data, int dataLength) {
+    if (!macMatches(source, CydGatewayMac) ||
+        (dataLength != sizeof(Packet) && dataLength != sizeof(CalibrationCommand))) {
         return;
     }
 
@@ -226,7 +235,8 @@ void onDataReceived(const uint8_t*, const uint8_t* data, int dataLength) {
     if (nextWriteIndex == receiveQueueReadIndex) {
         return;
     }
-    memcpy(&receiveQueue[receiveQueueWriteIndex].packet, data, sizeof(Packet));
+    memcpy(receiveQueue[receiveQueueWriteIndex].payload, data, dataLength);
+    receiveQueue[receiveQueueWriteIndex].length = dataLength;
     receiveQueueWriteIndex = nextWriteIndex;
 }
 
@@ -468,6 +478,111 @@ void sendSensorTelemetry() {
 }
 #endif
 
+void loadCalibration() {
+    calibrationBoot = esp_random();
+#ifdef ANTENNA_NODE_HAS_LSM303AGR
+    Preferences preferences;
+    // Read-only opening does not create a namespace or write defaults.
+    if (!preferences.begin("sensor-cal", true)) return;
+    CalibrationConfig stored{};
+    const int result = readCalibrationRecord(preferences, stored);
+    if (result == 1) {
+        calibration = stored;
+        calibrationSaved = (stored.flags & 7) != 0;
+    } else if (result < 0) calibrationStorageInvalid = true;
+    preferences.end();
+#endif
+}
+
+bool persistCalibration(CalibrationConfig candidate) {
+    Preferences preferences;
+    if (!preferences.begin("sensor-cal", false)) return false;
+    const bool ok = writeCalibrationRecord(preferences, candidate);
+    preferences.end();
+    if (ok) {
+        calibration = candidate;
+        calibrationSaved = (candidate.flags & 7) != 0;
+        calibrationStorageInvalid = false;
+    }
+    return ok;
+}
+
+void sendCalibrationReport(uint32_t request = 0, uint8_t error = 0) {
+    CalibrationReport report{};
+    report.type = 7; report.node = NodeId; report.version = ProtocolVersion;
+    report.sequence = ++sequenceNumber; report.boot = calibrationBoot;
+    report.request = request; report.error = error;
+    report.flags = calibration.flags | (calibrationSaved ? CalibrationSaved : 0) |
+        (calibrationStorageInvalid ? CalibrationStorageInvalid : 0);
+#ifdef ANTENNA_NODE_HAS_LSM303AGR
+    const float rawMag[3] = {magneticX, magneticY, magneticZ};
+    const float rawAccel[3] = {accelerationX/StandardGravityMetersPerSecondSquared,
+        accelerationY/StandardGravityMetersPerSecondSquared, accelerationZ/StandardGravityMetersPerSecondSquared};
+    // Use aligned local arrays rather than taking pointers into packed packets.
+    float mag[3]{}, acc[3]{};
+    correctVector(rawMag, calibration.magOffset, calibration.magMatrix, mag);
+    correctVector(rawAccel, calibration.accelOffset, calibration.accelMatrix, acc);
+    const bool magOk = magnetometerValid && std::isfinite(dot3(mag, mag));
+    const bool accOk = accelerometerValid && std::isfinite(dot3(acc, acc));
+    if (magOk) report.flags |= CalibrationMagValid;
+    if (accOk) report.flags |= CalibrationAccelValid;
+    memcpy(report.magnetic, mag, sizeof(mag));
+    memcpy(report.acceleration, acc, sizeof(acc));
+    float heading = 0, tilt = 0;
+    if ((calibration.flags & 7) == 7 && magOk && accOk &&
+        calibratedOrientation(calibration, mag, acc, &heading, &tilt)) {
+        report.flags |= CalibrationHeadingValid;
+        report.heading = heading; report.tilt = tilt;
+    }
+#endif
+    esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&report), sizeof(report));
+    emitCalibrationJson(report, "node_serial");
+}
+
+void handleCalibrationCommand(const CalibrationCommand& command) {
+    if (command.type != 6 || command.version != ProtocolVersion ||
+        command.node != NodeId || command.request == 0) return;
+#ifndef ANTENNA_NODE_HAS_LSM303AGR
+    sendCalibrationReport(command.request, 1); // Unsupported sensor hardware.
+#else
+    CalibrationConfig candidate = calibration;
+    const auto op = static_cast<CalibrationOperation>(command.operation);
+    uint8_t error = 0;
+    if (op == CalibrationOperation::Mag || op == CalibrationOperation::Accel) {
+        const bool mag = op == CalibrationOperation::Mag;
+        if ((mag && !magnetometerPresent) || (!mag && !accelerometerPresent)) error = 1;
+        memcpy(mag ? candidate.magOffset : candidate.accelOffset, command.values, 3*sizeof(float));
+        memcpy(mag ? candidate.magMatrix : candidate.accelMatrix, command.values+3, 9*sizeof(float));
+        candidate.flags |= mag ? MagCalibrated : AccelCalibrated;
+    } else if (op == CalibrationOperation::Align) {
+        const float forward = command.values[0], up = command.values[1];
+        if (!std::isfinite(forward) || !std::isfinite(up) ||
+            std::fabs(forward) < 1 || std::fabs(forward) > 3 ||
+            std::fabs(up) < 1 || std::fabs(up) > 3 ||
+            forward != std::trunc(forward) || up != std::trunc(up)) error = 2;
+        else { candidate.forwardAxis = forward; candidate.upAxis = up; }
+        candidate.declination = command.values[2];
+        candidate.flags |= MountConfigured;
+    } else if (op == CalibrationOperation::Save) {
+        if (!(calibration.flags & 7)) error = 2;
+        else if (!persistCalibration(calibration)) { error = 3; calibrationSaved = false; }
+    } else if (op == CalibrationOperation::Clear) {
+        if (!persistCalibration(defaultCalibration())) error = 3;
+    } else if (op != CalibrationOperation::Status) error = 2;
+    if (op == CalibrationOperation::Mag || op == CalibrationOperation::Accel || op == CalibrationOperation::Align) {
+        if (!validCalibration(candidate)) error = 2;
+        if (!error) {
+            candidate.checksum = calibrationChecksum(candidate);
+            if (memcmp(&candidate, &calibration, sizeof(candidate))) {
+                calibration = candidate;
+                calibrationSaved = false;
+            }
+        }
+    }
+    sendCalibrationReport(command.request, error);
+#endif
+}
+
 void beginPress() {
     modelButtonPressed = true;
     activeDirection = nextPressDirection;
@@ -640,9 +755,17 @@ void handleCommand(const Packet& packet) {
 
 void processReceivedPackets() {
     while (receiveQueueReadIndex != receiveQueueWriteIndex) {
-        const Packet packet = receiveQueue[receiveQueueReadIndex].packet;
+        const ReceivedPacket received = receiveQueue[receiveQueueReadIndex];
         receiveQueueReadIndex =
             (receiveQueueReadIndex + 1) % ReceiveQueueSize;
+        if (received.length == sizeof(CalibrationCommand)) {
+            CalibrationCommand command{};
+            memcpy(&command, received.payload, sizeof(command));
+            handleCalibrationCommand(command);
+            continue;
+        }
+        Packet packet{};
+        memcpy(&packet, received.payload, sizeof(packet));
         if (packet.protocolVersion != ProtocolVersion ||
             packet.senderId != static_cast<uint8_t>(DeviceId::CydGateway)) {
             continue;
@@ -667,6 +790,11 @@ void emitSerialCommandResult(const SerialRotatorCommand& command,
 }
 
 void handleSerialJson(char* line) {
+    CalibrationCommand calibrationCommand{};
+    if (parseCalibrationCommand(line, &calibrationCommand)) {
+        handleCalibrationCommand(calibrationCommand);
+        return;
+    }
     SerialRotatorCommand serialCommand{};
     if (!parseSerialRotatorCommand(line, &serialCommand) ||
         serialCommand.nodeId != NodeId) {
@@ -702,14 +830,15 @@ void pollSerial() {
         }
         if (character == '\n') {
             serialLine[serialLineLength] = '\0';
-            if (serialLineLength > 0) {
+            if (serialLineLength > 0 && !serialLineOverflow) {
                 handleSerialJson(serialLine);
             }
             serialLineLength = 0;
-        } else if (serialLineLength < SerialLineLength - 1) {
+            serialLineOverflow = false;
+        } else if (!serialLineOverflow && serialLineLength < SerialLineLength - 1) {
             serialLine[serialLineLength++] = character;
         } else {
-            serialLineLength = 0;
+            serialLineOverflow = true;
         }
     }
 }
@@ -717,6 +846,7 @@ void pollSerial() {
 
 void setup() {
     Serial.begin(SerialBaudRate);
+    loadCalibration();
     pinMode(BuiltInLedPin, OUTPUT);
     digitalWrite(BuiltInLedPin, LOW);
 
@@ -749,6 +879,7 @@ void loop() {
 #ifdef ANTENNA_NODE_HAS_LSM303AGR
         sendSensorTelemetry();
 #endif
+        sendCalibrationReport();
         nextStatusMs = nowMs + StatusPeriodMs;
     }
 }

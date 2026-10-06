@@ -13,8 +13,9 @@ from rich.markup import escape
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static
+from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane
 from textual_plotext import PlotextPlot
 
 if TYPE_CHECKING:
@@ -33,7 +34,53 @@ LOG_FILTERS = (
     "ack",
     "error",
     "client",
+    "calibration",
 )
+
+
+class CalibrationHelp(ModalScreen):
+    """Operator instructions; calibration progress remains in the dashboard."""
+
+    BINDINGS = [("escape", "close_help", "Close")]
+    DEFAULT_CSS = """
+    CalibrationHelp { align: center middle; }
+    #cal-help { width: 92%; max-width: 100; height: auto; max-height: 95%;
+        padding: 1 2; background: #06334b; border: thick #168aad; overflow-y: auto; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cal-help"):
+            yield Static(
+                "[bold]NODE 2 SENSOR CALIBRATION[/]\n\n"
+                "Stop antenna motion. Use the final sensor/electronics arrangement.\n"
+                "These captures require moving the sensor by hand.\n\n"
+                "[bold]1. Magnetometer[/]\n"
+                "Enter [cyan]cal 2 start mag[/], then slowly tumble ALL three axes.\n"
+                "Collect at least 120 samples (about two minutes). A level circle is insufficient.\n"
+                "Enter [cyan]cal 2 fit mag[/]. If it passes, enter [cyan]cal 2 apply mag[/].\n\n"
+                "[bold]2. Accelerometer[/]\n"
+                "Point sensor +X UP, hold still, then enter [cyan]cal 2 face +x[/].\n"
+                "Wait for 12 samples. Repeat with -x, +y, -y, +z, -z pointing UP.\n"
+                "Enter [cyan]cal 2 fit accel[/], then [cyan]cal 2 apply accel[/].\n\n"
+                "[bold]3. Mounting and true north[/]\n"
+                "Enter [cyan]cal 2 align <forward-axis> <up-axis> <declination>[/].\n"
+                "Example: [cyan]cal 2 align +x +z -12[/] ONLY if +X points along the Yagi,\n"
+                "+Z points up and local declination is 12 degrees west. Use your actual values.\n"
+                "Axes must align with the mount. Check corrected heading at surveyed bearings.\n\n"
+                "[bold]4. Save[/]\n"
+                "Enter [cyan]cal 2 save[/]. Wait for NODE confirmation and SAVED.\n"
+                "Power-cycle later and verify [cyan]cal 2 status[/].\n"
+                "[cyan]cal 2 clear[/] erases saved corrections; [cyan]cal 2 cancel[/] ends capture.\n\n"
+                "Corrected heading is diagnostic; rotator position remains simulated."
+            )
+            yield Button("Close — enter commands in the manual field", id="cal-help-close")
+
+    @on(Button.Pressed, "#cal-help-close")
+    def close_help(self) -> None:
+        self.dismiss()
+
+    def action_close_help(self) -> None:
+        self.dismiss()
 
 
 @dataclass
@@ -79,15 +126,15 @@ class AntennaControllerApp(App[None]):
     }
 
     #history {
-        height: 2fr;
-        min-height: 12;
+        height: 1fr;
+        min-height: 10;
         border: round #168aad;
         background: #020b12;
     }
 
     #lower {
         height: 2fr;
-        min-height: 15;
+        min-height: 18;
     }
 
     #health-column {
@@ -110,7 +157,15 @@ class AntennaControllerApp(App[None]):
     }
 
     #calibration {
-        height: 6;
+        height: 1fr;
+    }
+
+    #health-tabs {
+        height: 1fr;
+    }
+
+    TabPane {
+        padding: 0;
     }
 
     #raw-log {
@@ -147,6 +202,7 @@ class AntennaControllerApp(App[None]):
         Binding("n", "cycle_node", "Node"),
         Binding("o", "toggle_online", "Online/offline"),
         Binding("u", "focus_manual", "Manual"),
+        Binding("c", "calibration_help", "Calibration"),
         Binding("left", "step_node(1,-5)", "N1 -5°", show=False),
         Binding("right", "step_node(1,5)", "N1 +5°", show=False),
         Binding("a", "step_node(2,-5)", "N2 -5°", show=False),
@@ -206,9 +262,12 @@ class AntennaControllerApp(App[None]):
         yield PlotextPlot(id="history")
         with Horizontal(id="lower"):
             with Vertical(id="health-column"):
-                yield Static(id="node-health", classes="panel")
-                yield Static(id="heartbeats", classes="panel")
-                yield Static(id="calibration", classes="panel")
+                with TabbedContent(id="health-tabs"):
+                    with TabPane("Health", id="health-tab"):
+                        yield Static(id="node-health", classes="panel")
+                        yield Static(id="heartbeats", classes="panel")
+                    with TabPane("Calibration", id="calibration-tab"):
+                        yield Static(id="calibration", classes="panel")
             yield RichLog(id="raw-log", markup=True, wrap=False, highlight=False)
         with Horizontal(id="command-bar"):
             yield Input(
@@ -218,6 +277,7 @@ class AntennaControllerApp(App[None]):
                 id="command-input",
             )
             yield Button("SEND", id="send-command", variant="primary")
+            yield Button("Cal", id="cal-help-button")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -225,6 +285,9 @@ class AntennaControllerApp(App[None]):
         self.refresh_dashboard()
 
     def refresh_dashboard(self) -> None:
+        # The timer can tick during teardown or while the help modal is active.
+        if not self.query("#status-bar"):
+            return
         states = self.controller.states.snapshot()
         stamp = tuple(state.measured_utc_ms for state in states)
         if stamp != self._last_state_stamp:
@@ -342,18 +405,14 @@ class AntennaControllerApp(App[None]):
         sensor = states[1]
         magnetic = self._vector_text(sensor.magnetic_ut, 1, "µT")
         acceleration = self._vector_text(sensor.acceleration_g, 3, "g")
-        status = (
-            "[yellow]UNCALIBRATED[/]"
-            if sensor.sensor_flags & 0x08
-            else "[red]NO SENSOR[/]"
-        )
+        status = escape(self.controller.calibration.describe(2))
         self.query_one("#calibration", Static).update(
             "[bold cyan]N2 SENSOR / CALIBRATION[/]  "
             + status
             + "\n"
             + f"Bxyz {magnetic}\n"
             + f"Axyz {acceleration}\n"
-            + "[dim]Hard/soft-iron and mounting calibration pending[/]"
+            + "[dim]c: instructions | cal 2 status: query node[/]"
         )
 
     def _update_events(self) -> None:
@@ -373,6 +432,7 @@ class AntennaControllerApp(App[None]):
                 "ack": "magenta",
                 "error": "red",
                 "system": "orange1",
+                "calibration": "cyan",
             }.get(event_type, "grey62")
             stamp = time.strftime("%H:%M:%S", time.gmtime(float(event["utc"])))
             log.write(
@@ -542,6 +602,9 @@ class AntennaControllerApp(App[None]):
         fields = shlex.split(command.lower())
         if not fields:
             raise ValueError("empty command")
+        if fields[0] == "cal":
+            self.query_one("#health-tabs", TabbedContent).active = "calibration-tab"
+            return self.controller.calibration.command(fields[1:])
         if fields[0] == "goto" and len(fields) == 3:
             route = self.controller._send_rotator_command(
                 int(fields[1]), "goto", azimuth_deg=float(fields[2])
@@ -603,6 +666,11 @@ class AntennaControllerApp(App[None]):
 
     def action_focus_manual(self) -> None:
         self.query_one("#command-input", Input).focus()
+
+    @on(Button.Pressed, "#cal-help-button")
+    def action_calibration_help(self) -> None:
+        self.query_one("#health-tabs", TabbedContent).active = "calibration-tab"
+        self.push_screen(CalibrationHelp())
 
     def action_step_node(self, node_id: int, delta_deg: float) -> None:
         try:

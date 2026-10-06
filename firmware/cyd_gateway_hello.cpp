@@ -10,6 +10,7 @@
 
 #include "espnow_smoke_config.h"
 #include "serial_json_protocol.h"
+#include "calibration_protocol.h"
 
 namespace {
 using namespace antenna_controller;
@@ -22,7 +23,7 @@ constexpr uint32_t NodeOfflineMs = 5000;
 constexpr uint32_t SensorOfflineMs = 3000;
 constexpr uint8_t EventLogLineCount = 4;
 constexpr uint8_t EventLogLineLength = 42;
-constexpr uint8_t SerialLineLength = 192;
+constexpr size_t SerialLineLength = 768;
 constexpr int HeaderDebugButtonX = 88;
 constexpr int HeaderDebugButtonWidth = 42;
 constexpr uint8_t TouchIrqPin = 36;
@@ -39,7 +40,7 @@ SPIClass touchscreenSpi(VSPI);
 XPT2046_Touchscreen touchscreen(TouchCsPin, TouchIrqPin);
 
 struct ReceivedPacket {
-    uint8_t payload[sizeof(SensorTelemetry)];
+    uint8_t payload[sizeof(CalibrationReport)];
     uint8_t payloadLength;
     uint8_t sourceMac[6];
 };
@@ -74,7 +75,8 @@ volatile uint32_t nodeRssiUpdatedMs[AntennaNodeCount]{};
 NodeStatus nodeStatus[AntennaNodeCount]{};
 char eventLog[EventLogLineCount][EventLogLineLength]{};
 char serialLine[SerialLineLength]{};
-uint8_t serialLineLength = 0;
+size_t serialLineLength = 0;
+bool serialLineOverflow = false;
 uint32_t sequenceNumber = 0;
 uint32_t nextTimeSyncMs = 500;
 uint32_t lastUiClockSecond = UINT32_MAX;
@@ -450,7 +452,7 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
 void onDataReceived(const uint8_t* sourceMac,
                     const uint8_t* data,
                     int dataLength) {
-    if (dataLength != sizeof(Packet) &&
+    if (dataLength != sizeof(Packet) && dataLength != sizeof(CalibrationReport) &&
         dataLength != sizeof(SensorTelemetry)) {
         return;
     }
@@ -588,6 +590,16 @@ void processReceivedPackets() {
         receiveQueueReadIndex =
             (receiveQueueReadIndex + 1) % ReceiveQueueSize;
 
+        if (received.payloadLength == sizeof(CalibrationReport)) {
+            CalibrationReport report{};
+            memcpy(&report, received.payload, sizeof(report));
+            if (report.type == 7 && report.version == ProtocolVersion &&
+                nodeIndex(report.node) >= 0 &&
+                macMatches(received.sourceMac, antennaNodeMac(report.node))) {
+                emitCalibrationJson(report, "espnow");
+            }
+            continue;
+        }
         if (received.payloadLength == sizeof(SensorTelemetry)) {
             SensorTelemetry telemetry{};
             memcpy(&telemetry, received.payload, sizeof(telemetry));
@@ -798,6 +810,14 @@ void keypadKey(const char* key) {
 
 void handleSerialLine(char* line) {
     if (line[0] == '{') {
+        CalibrationCommand calibrationCommand{};
+        if (parseCalibrationCommand(line, &calibrationCommand)) {
+            const esp_err_t result = esp_now_send(antennaNodeMac(calibrationCommand.node),
+                reinterpret_cast<const uint8_t*>(&calibrationCommand), sizeof(calibrationCommand));
+            // Only the node can acknowledge applying or saving calibration.
+            if (result != ESP_OK) Serial.println("CAL gateway radio send failed");
+            return;
+        }
         SerialRotatorCommand serialCommand{};
         if (!parseSerialRotatorCommand(line, &serialCommand)) {
             Serial.println(
@@ -919,10 +939,13 @@ void pollSerial() {
         }
         if (character == '\n') {
             serialLine[serialLineLength] = '\0';
-            handleSerialLine(serialLine);
+            if (!serialLineOverflow && serialLineLength) handleSerialLine(serialLine);
             serialLineLength = 0;
-        } else if (serialLineLength < SerialLineLength - 1) {
+            serialLineOverflow = false;
+        } else if (!serialLineOverflow && serialLineLength < SerialLineLength - 1) {
             serialLine[serialLineLength++] = character;
+        } else {
+            serialLineOverflow = true;
         }
     }
 }

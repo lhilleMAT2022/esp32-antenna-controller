@@ -3,6 +3,7 @@
 ## Status: In Progress
 
 **Last updated:** 2026-10-05
+**Calibration increment:** 2026-10-06; software implemented, hardware acceptance pending.
 **Architecture:** [rotator-controller-architecture.md](rotator-controller-architecture.md)  
 **Test plan:** [rotator-controller-test-plan.md](rotator-controller-test-plan.md)
 
@@ -16,6 +17,7 @@
 | 3 — Hardware smoke test | Complete | Build, flash and verify all three boards |
 | 4 — Physical integration | In progress | Magnetometer bring-up; isolated relay interface and encryption remain |
 | 4a — Redundant communications | In progress | Machine JSON serial, host AC, Pi relay, TCP 31995 failover |
+| 4b — Persistent sensor calibration | Software implemented | Host capture/fitting, node apply/save/load/clear, calibration acknowledgments and TUI; physical power-cycle acceptance pending |
 
 ## Parameters
 
@@ -57,3 +59,8 @@ the host AC adapter on TCP 31988/UDP 31989, and the optional Pi relay on TCP
 31995. Bench validation must prove primary routing, forced backup routing,
 stale-primary failover, and direct sensor reporting before any relay GPIO is
 assigned.
+
+Calibration implementation and the remaining physical acceptance sequence are
+documented in [the calibration procedure](../../../calibration.md). Corrected
+orientation remains diagnostic until installation validation and measured
+feedback integration are complete.

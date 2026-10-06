@@ -4,6 +4,7 @@ version = "0.2.0"
 description = "Host Antenna Controller and remote-node serial relay"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy>=1.26,<3",
     "pyserial>=3.5,<4",
     "textual>=8.2,<9",
     "textual-plotext>=1.0,<2",
