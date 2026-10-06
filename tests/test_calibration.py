@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import shutil
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from antenna_controller.calibration import CalibrationManager, FACES, fit_accelerometer, fit_magnetometer
+from antenna_controller.calibration import CalibrationManager, FACES, accelerometer_diagnostics, fit_accelerometer, fit_magnetometer
 from antenna_controller.bridge import AntennaController, parse_board_line
 
 
@@ -22,6 +23,17 @@ def magnetic_capture(count=400):
     offset = np.array([18, -26, 9])
     raw = (directions * 48) @ distortion.T + offset + rng.normal(0, .1, (count, 3))
     return raw, directions, offset
+
+
+def acceleration_capture(tilt_deg=0):
+    faces = {}
+    for j, face in enumerate(FACES):
+        vector = np.zeros(3)
+        vector[j//2] = 1 if face[0] == '+' else -1
+        faces[face] = np.tile(vector, (12, 1)).tolist()
+    tilt = math.radians(tilt_deg)
+    faces['+x'] = [[math.cos(tilt), math.sin(tilt), 0] for _ in range(12)]
+    return faces
 
 
 class FittingTests(unittest.TestCase):
@@ -67,6 +79,36 @@ class FittingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Movement"):
             fit_accelerometer(faces)
 
+    def test_steady_tilt_passes_prechecks_but_reports_failed_face(self):
+        faces = acceleration_capture(8)
+        detail = accelerometer_diagnostics(faces)
+        self.assertEqual(detail['failed_faces'], ['+x'])
+        self.assertEqual(detail['worst_face'], '+x')
+        self.assertAlmostEqual(detail['residual_g'], math.sin(math.radians(8)))
+        for metrics in detail['faces'].values():
+            self.assertEqual(metrics['problems'], [])
+        with self.assertRaisesRegex(ValueError, r"Six-face validation failed: \+x 0.1392 g"):
+            fit_accelerometer(faces)
+
+    def test_scale_failure_contains_measured_gains(self):
+        faces = acceleration_capture()
+        for face in ('+x', '-x'):
+            faces[face] = (np.array(faces[face]) * .75).tolist()
+        detail = accelerometer_diagnostics(faces)
+        self.assertFalse(detail['passed'])
+        self.assertAlmostEqual(detail['gains'][0], 4/3)
+        self.assertIn('gains [1.3333, 1.0, 1.0]', detail['error'])
+
+    def test_diagnostics_reports_each_missing_or_invalid_face(self):
+        faces = acceleration_capture()
+        del faces['+x']
+        faces['-y'][0][0] = float('nan')
+        detail = accelerometer_diagnostics(faces)
+        self.assertFalse(detail['passed'])
+        self.assertEqual(len(detail['faces']['+x']['problems']), 1)
+        self.assertEqual(len(detail['faces']['-y']['problems']), 1)
+        json.dumps(detail, allow_nan=False)
+
 
 def status(q=1, boot=99, request=0, flags=96, error=0):
     return {"t": "cs", "n": 2, "q": q, "boot": boot, "req": request, "cf": flags, "e": error}
@@ -75,7 +117,11 @@ def status(q=1, boot=99, request=0, flags=96, error=0):
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.sent, self.events = [], []
-        self.manager = CalibrationManager(lambda n, m: self.sent.append(m) or "gateway", lambda n, m: self.events.append(m))
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.capture_dir = Path(temporary.name) / 'captures'
+        self.manager = CalibrationManager(lambda n, m: self.sent.append(m) or "gateway",
+                                          lambda n, m: self.events.append(m), self.capture_dir)
         self.manager.ingest(status())
 
     def test_save_waits_for_matching_node_ack_and_times_out(self):
@@ -128,6 +174,93 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.sent[0]['op'], 'mag')
         self.assertEqual(len(self.sent[0]['v']), 12)
         self.assertIn('NODE confirmation', self.manager.describe(2))
+
+    def test_failed_fit_archives_raw_faces_and_reproducible_diagnostics(self):
+        self.manager.nodes[2].faces = acceleration_capture(8)
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, 'Capture saved to'):
+                self.manager.command(['2', 'fit', 'accel'])
+        attempts = list(self.capture_dir.glob('*fit-accel-failed*.json'))
+        self.assertEqual(len(attempts), 2)
+        record = json.loads(attempts[0].read_text(encoding='utf-8'))
+        self.assertEqual(record['node'], 2)
+        self.assertEqual(record['boot'], 99)
+        self.assertEqual(record['faces'], acceleration_capture(8))
+        self.assertEqual(record['accel_diagnostics']['failed_faces'], ['+x'])
+        with self.assertRaisesRegex(ValueError, '0.1392'):
+            fit_accelerometer(record['faces'])
+        self.assertEqual(self.manager.nodes[2].faces, record['faces'])
+        self.assertEqual(self.sent, [])
+
+    def test_sample_checkpoint_survives_new_capture_and_node_reboot(self):
+        self.manager.command(['2', 'start', 'mag'])
+        raw = {'t': 'rs', 'n': 2, 'q': 10, 'sf': 15, 'm': [20, 30, 40]}
+        self.manager.ingest(raw)
+        path = self.manager.nodes[2].capture_path
+        self.manager.ingest(raw)
+        record = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(record['samples'], [[20, 30, 40]])
+        self.assertEqual(record['last_sequence'], 10)
+        self.assertEqual(record['sample_kind'], 'mag')
+        self.manager.command(['2', 'face', '+x'])
+        self.manager.ingest({'t': 'rs', 'n': 2, 'q': 11, 'sf': 15, 'a': [1, 0, 0]})
+        face_path = self.manager.nodes[2].capture_path
+        self.assertNotEqual(face_path, path)
+        self.manager.ingest(status(1, boot=100))
+        self.assertEqual(self.manager.nodes[2].samples, [])
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8')), record)
+        self.assertEqual(json.loads(face_path.read_text(encoding='utf-8'))['samples'], [[1, 0, 0]])
+        archived = list(self.capture_dir.glob('*before-node-restart*.json'))
+        self.assertEqual(json.loads(archived[0].read_text(encoding='utf-8'))['boot'], 99)
+
+    def test_replacing_failed_face_preserves_other_faces_and_passes(self):
+        self.manager.nodes[2].faces = acceleration_capture(8)
+        self.manager.command(['2', 'face', '+x'])
+        for seq in range(12):
+            self.manager.ingest({'t': 'rs', 'n': 2, 'q': seq, 'sf': 15, 'a': [1, 0, 0]})
+        self.manager.command(['2', 'fit', 'accel'])
+        record = json.loads(self.manager.nodes[2].last_archive.read_text(encoding='utf-8'))
+        self.assertEqual(record['faces'], acceleration_capture())
+        self.assertTrue(record['accel_diagnostics']['passed'])
+        self.assertAlmostEqual(record['fits']['accel']['residual'], 0)
+        self.assertEqual(self.sent, [])
+
+    def test_export_works_when_status_is_stale_without_sending_to_node(self):
+        self.manager.nodes[2].faces = acceleration_capture()
+        self.manager.nodes[2].seen = 0
+        response = self.manager.command(['2', 'export'])
+        self.assertIn(str(self.capture_dir), response)
+        record = json.loads(self.manager.nodes[2].last_archive.read_text(encoding='utf-8'))
+        self.assertEqual(record['faces'], acceleration_capture())
+        self.assertEqual(self.sent, [])
+
+    def test_failed_mag_fit_is_saved_while_capture_continues(self):
+        self.manager.command(['2', 'start', 'mag'])
+        raw = {'t': 'rs', 'n': 2, 'q': 10, 'sf': 15, 'm': [20, 30, 40]}
+        self.manager.ingest(raw)
+        with self.assertRaisesRegex(ValueError, '120 distinct samples'):
+            self.manager.command(['2', 'fit', 'mag'])
+        attempt = self.manager.nodes[2].last_archive
+        self.manager.ingest(dict(raw, q=11, m=[21, 31, 41]))
+        self.assertEqual(self.manager.nodes[2].mode, 'mag')
+        self.assertEqual(len(self.manager.nodes[2].samples), 2)
+        self.assertEqual(json.loads(attempt.read_text(encoding='utf-8'))['samples'], [[20, 30, 40]])
+
+    def test_disk_failure_keeps_memory_and_last_good_file_then_recovers(self):
+        self.manager.command(['2', 'face', '+x'])
+        path = self.manager.nodes[2].capture_path
+        previous = path.read_bytes()
+        with patch('antenna_controller.calibration.Path.replace', side_effect=OSError('disk unavailable')):
+            self.manager.ingest({'t': 'rs', 'n': 2, 'q': 1, 'sf': 15, 'a': [1, 0, 0]})
+            self.assertIn('NOT saved', self.manager.describe(2))
+            self.assertEqual(len(self.manager.nodes[2].samples), 1)
+            self.assertEqual(path.read_bytes(), previous)
+            self.assertFalse(path.with_suffix('.tmp').exists())
+            with self.assertRaisesRegex(ValueError, 'NOT saved'):
+                self.manager.command(['2', 'export'])
+        self.manager.ingest({'t': 'rs', 'n': 2, 'q': 2, 'sf': 15, 'a': [1, 0, 0]})
+        self.assertEqual(len(json.loads(path.read_text(encoding='utf-8'))['samples']), 2)
+        self.assertEqual(self.manager.nodes[2].archive_error, '')
 
     def test_calibration_protocol_and_backup_routing(self):
         self.assertEqual(parse_board_line('{"t":"cc","n":2}')['t'], 'cc')

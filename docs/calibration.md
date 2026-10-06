@@ -16,8 +16,11 @@ Node 1 currently has no sensor; it rejects calibration operations.
 
 Stop antenna motion. Calibration involves turning the sensor assembly by
 hand, with its mounting hardware and nearby electronics in their final
-relative arrangement. The capture buffers are held in AC memory. Restarting
-AC loses unsent fits; restarting the node cancels captures and clears fits.
+relative arrangement. AC checkpoints raw capture buffers to JSON files under
+`calibration_captures/` in its working directory. Restarting AC loses the active
+in-memory workflow; restarting the node cancels captures and clears fits.
+Files already saved remain available for analysis, but are not automatically
+loaded into a new workflow. See the diagnostics section below.
 
 1. Enter `cal 2 start mag`. Slowly tumble the sensor through all three axes
    and eight octants for at least 120 samples (about two minutes at 1 Hz).
@@ -52,6 +55,52 @@ accelerometer fit estimates three biases and three diagonal gains in g.
 Gravity remains part of acceleration. A 60 cm mounting radius matters for
 acceleration during rotation, so orientation is evaluated while stationary.
 
+## Capture files and failed-fit diagnostics
+
+The host creates a separate JSON file for each magnetometer capture or
+accelerometer face capture and checkpoints it after every accepted sample.
+Writes replace the file atomically, keeping the previous checkpoint intact if
+the update fails. Each fit attempt also creates a separate snapshot, whether
+it passes or fails. Repeating a face or starting a new capture does not erase
+earlier files. Cancellation and detected node restarts archive the host state.
+These files are excluded from Git.
+
+Files contain the node/boot IDs, UTC snapshot time, last raw sequence, latest
+node status, raw samples with their capture kind, all completed accel faces,
+successful fits, and the fit error when applicable. `accel_diagnostics` includes
+per-face means and standard deviations, orientation checks, fitted offsets
+and gains when computable, corrected vectors and vector errors, the worst face,
+and acceptance limits. Acceleration uses g; magnetic raw vectors use microtesla.
+
+Enter `cal 2 export` in AC's manual field to save an additional snapshot and
+display its full path. This works without fresh node telemetry and sends
+nothing to the node. Fit results also log the snapshot path. In PowerShell,
+inspect the newest snapshot from the project directory with:
+
+```powershell
+$captureFile = Get-ChildItem .\calibration_captures\*.json |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$captureRecord = Get-Content -Raw -LiteralPath $captureFile.FullName | ConvertFrom-Json
+$captureRecord.accel_diagnostics | ConvertTo-Json -Depth 10
+```
+
+A stationary face can pass the initial checks and still fail the final fit:
+the initial gates permit up to 0.025 g per-axis standard deviation and 0.25 g
+of cross-axis mean, whereas the final corrected vector must be within 0.08 g
+of the expected unit vector. For example, an otherwise ideal +X capture held
+steadily at an 8-degree tilt passes the initial gates but has about 0.139 g
+final error. Failure details identify faces exceeding the final limit. Support
+the sensor so the named axis points vertically, recapture affected faces, and
+run `cal 2 fit accel` again. Other completed faces remain in memory. A reported
+face error can also reflect imperfect fitted coefficients, so inspect all face
+means and gains if recapturing that face does not resolve it.
+
+Disk errors appear as **Capture file NOT saved**; calibration continues in
+memory. Check the error before closing AC. This feature requires restarting AC
+after updating the Python code. Older running instances have no disk archive
+or export command; updating files cannot recover their in-memory samples.
+ESP32 NVS saves coefficients/configuration only, not these raw samples.
+
 ## Save, clear, and recover
 
 - `cal 2 save`: save the currently applied settings. Wait for **Node confirmed
@@ -60,6 +109,7 @@ acceleration during rotation, so orientation is evaluated while stationary.
 - `cal 2 clear`: atomically replace the saved record with defaults and reset
   active corrections. This clears calibration persistently.
 - `cal 2 cancel`: stop host capture without changing the node or flash.
+- `cal 2 export`: save host capture/diagnostic data to disk; does not write NVS.
 
 The node returns a response with the original request ID. Sending bytes to a
 gateway never counts as confirmation. A five-second timeout means the outcome

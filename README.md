@@ -69,6 +69,21 @@ with `uv sync --inexact`, and press `c` or click **Cal** in the TUI. Follow the
 saving, and the hardware acceptance checks. The checkpoint above records the
 state before this increment.
 
+The first operator calibration run passed the magnetometer fit (reported
+residual 0.0484) but failed the final accelerometer consistency check with
+"Six-face validation failed; check alignment and repeat". This indicates at
+least one corrected face exceeded 0.08 g of vector error; the affected face and
+physical cause have not yet been identified. The original host retained
+raw captures only in memory, so this attempt has no automatic disk archive.
+The host now checkpoints samples and fit attempts under `calibration_captures/`,
+supports `cal 2 export`, and reports per-face accelerometer errors and limits.
+This requires an AC restart to activate; it cannot recover samples from the
+older running process. All 34 host/native/TUI tests pass, including a steady
+tilt that passes preliminary gates, failed-fit archival, face replacement,
+and disk-write failure recovery. Calibration save/power-cycle acceptance
+remains pending. See the
+[capture diagnostics](docs/calibration.md#capture-files-and-failed-fit-diagnostics).
+
 ## Scope
 
 - CYD gateway/operator-console and antenna-node firmware
