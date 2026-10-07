@@ -174,6 +174,10 @@ class AntennaControllerApp(App[None]):
         margin-right: 1;
     }
 
+    #lines-button {
+        width: 16;
+    }
+
     #history {
         height: 1fr;
         min-height: 10;
@@ -248,6 +252,7 @@ class AntennaControllerApp(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("m", "cycle_mode", "Graph mode"),
+        Binding("l,L", "toggle_lines", "Lines", key_display="L"),
         Binding("t", "cycle_window", "Time window"),
         Binding("n", "cycle_node", "Node"),
         Binding("o", "toggle_online", "Online/offline"),
@@ -269,6 +274,7 @@ class AntennaControllerApp(App[None]):
             for route in ("gateway", "backup")
         }
         self.mode = "track"
+        self.connect_lines = False
         self.window_s = 60
         self.node_filter = "all"
         self.calibration_node = 2
@@ -310,6 +316,7 @@ class AntennaControllerApp(App[None]):
                 allow_blank=False,
                 id="log-select",
             )
+            yield Button("L Lines: off", id="lines-button")
         yield PlotextPlot(id="history")
         with Horizontal(id="lower"):
             with Vertical(id="health-column"):
@@ -552,7 +559,8 @@ class AntennaControllerApp(App[None]):
         ]
         finite = [(x, y) for x, y in values if y is not None]
         if finite:
-            plot.plot(
+            self._plot_series(
+                plot,
                 [item[0] for item in finite],
                 [item[1] for item in finite],
                 color=color,
@@ -585,12 +593,20 @@ class AntennaControllerApp(App[None]):
                     if vector is not None
                 ]
                 if finite:
-                    plot.plot(
+                    self._plot_series(
+                        plot,
                         [item[0] for item in finite],
                         [item[1] for item in finite],
                         color=color,
                         label=f"N{node_id} {axes[axis]}",
                     )
+
+    def _plot_series(self, plot: object, x: list[float], y: list[float],
+                     *, color: str, label: str) -> None:
+        if self.connect_lines:
+            plot.plot(x, y, marker=".", color=color)
+        # Draw samples last so their markers remain distinct from the line.
+        plot.scatter(x, y, marker="x", color=color, label=label)
 
     def _node_selected(self, node_id: int) -> bool:
         return self.node_filter == "all" or self.node_filter == f"node {node_id}"
@@ -701,6 +717,14 @@ class AntennaControllerApp(App[None]):
     def action_cycle_mode(self) -> None:
         index = (GRAPH_MODES.index(self.mode) + 1) % len(GRAPH_MODES)
         self.query_one("#mode-select", Select).value = GRAPH_MODES[index]
+
+    @on(Button.Pressed, "#lines-button")
+    def action_toggle_lines(self) -> None:
+        self.connect_lines = not self.connect_lines
+        button = self.query_one("#lines-button", Button)
+        button.label = f"L Lines: {'on' if self.connect_lines else 'off'}"
+        button.variant = "primary" if self.connect_lines else "default"
+        self._update_plot()
 
     def action_cycle_window(self) -> None:
         index = (TIME_WINDOWS.index(self.window_s) + 1) % len(TIME_WINDOWS)

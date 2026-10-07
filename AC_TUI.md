@@ -2,6 +2,12 @@
 
 ## Overview
 
+Plots use `x` sample markers with no connecting lines by default in every
+graph mode. Press **L** or click **L Lines: off/on** beside the graph controls
+to toggle connecting lines drawn with `.` characters. Sample markers remain
+`x` with lines enabled. The selection persists across graph modes during the
+session and defaults to off on restart.
+
 Implemented runtime update (2026-10-07): the Calibration tab always shows
 both nodes' calibration status and raw A/B XYZ + MAE (magnitude, azimuth°,
 elevation°), with sample age. Selection controls calibration help, not which

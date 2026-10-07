@@ -10,6 +10,9 @@ connected over ESP-NOW, node firmware, and a host-side control adapter.
 
 ## Current development snapshot — 2026-10-07
 
+TUI plots default to unconnected `x` markers. Press **L** or click
+**L Lines: off/on** to toggle dotted (`.`) connecting lines in any graph mode.
+
 Both nodes now appear in the TUI calibration panel with A/B XYZ and
 magnitude/azimuth°/elevation° (MAE). Health shows actual reporting mode,
 quiet time remaining, node/CYD/PC UTC comparisons, sync correction and age.
