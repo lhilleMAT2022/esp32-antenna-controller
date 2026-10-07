@@ -1,6 +1,6 @@
 # Node reporting, timing, and displays
 
-Current implementation: 2026-10-07, ESP-NOW protocol **5**. This specification
+Current implementation: 2026-10-07, ESP-NOW protocol **6**. This specification
 supersedes earlier fixed-rate node reporting and integer-second clock behavior.
 Nodes 1 (SURV) and 2 (REF) implement the same sensor/calibration/runtime features.
 Rotator movement is still simulated; no physical relay is actuated.
@@ -101,7 +101,7 @@ not a claim of continuous measurement delivery.
 
 ## Wire contract
 
-All three boards must run protocol 5 together; older versions are incompatible.
+All three boards must run protocol 6 together; older versions are incompatible.
 Packed little-endian ESP32 layouts are defined in `espnow_smoke_config.h`,
 `runtime_protocol.h`, and `calibration_protocol.h`. There is no JSON on air.
 
@@ -111,6 +111,7 @@ Packed little-endian ESP32 layouts are defined in `espnow_smoke_config.h`,
 | Raw sensors | 26 | 5 |
 | Calibration command / report | 56 / 52 | 6 / 7 |
 | Reporting command / ACK | 12 / 62 | 8 / 9 |
+| Scheduled slew command / lifecycle reply | 70 / 9 | 10 / 11 |
 
 Reporting command layout is `type:u8,node:u8,version:u8,mode:u8,request:u32,
 durationSeconds:u32`; modes are continuous=0, normal=1, quiet=2. Request ID is
@@ -164,9 +165,13 @@ both nodes in normal mode; does not change calibration or command movement):
 
 This records raw JSON in ignored `runtime-smoke.log`. Enumerate ports first.
 
-On hardware, verify both node IDs, protocol 5, advancing UTC, one-second USB
+On hardware, verify both node IDs, protocol 6, advancing UTC, one-second USB
 telemetry in every mode, normal ten-second RF reports, a static quiet window
 over 60 seconds, timer expiry, and the physical display. Repeat with hand
 rotation beyond 10° using valid sensors. Test commanded-motion cadence with
 the simulator; physical relay control and calibration save/power-cycle
 acceptance remain separate work.
+
+Scheduled bearing plans are specified in [Scheduled slews](scheduled-slews.md).
+Protocol 6 preserves protocol-5 timing and existing packet layouts while
+adding those command/reply types.

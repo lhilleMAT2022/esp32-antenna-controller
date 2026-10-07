@@ -16,6 +16,7 @@
 #include "serial_json_protocol.h"
 #include "calibration_protocol.h"
 #include "runtime_protocol.h"
+#include "slew_protocol.h"
 
 #ifndef ANTENNA_NODE_ID
 #error "ANTENNA_NODE_ID must be defined by the PlatformIO environment"
@@ -62,7 +63,7 @@ float pitchDeg = 0.0F;
 #endif
 
 struct ReceivedPacket {
-    uint8_t payload[64];
+    uint8_t payload[sizeof(SlewCommand)];
     uint8_t length;
 };
 
@@ -85,6 +86,7 @@ UtcClock utcClock;
 ReportingPolicy reporting(NodeId);
 OrientationReference quietOrientation;
 ReportingRequests reportingRequests;
+SlewQueue slewQueue;
 uint8_t lastCalibrationFlags = 0;
 ScheduledCommand scheduledCommands[ScheduledCommandCount]{};
 
@@ -181,7 +183,7 @@ uint8_t statusFlags() {
     if (timeValid) {
         flags |= StatusFlag::TimeValid;
     }
-    if (isMoving()) {
+    if (isMoving() || slewQueue.running()) {
         flags |= StatusFlag::Moving;
     }
     if (modelButtonPressed) {
@@ -193,6 +195,7 @@ uint8_t statusFlags() {
             break;
         }
     }
+    if (slewQueue.pending()) flags |= StatusFlag::QueuePending;
     return flags;
 }
 
@@ -227,7 +230,7 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
 void onDataReceived(const uint8_t* source, const uint8_t* data, int dataLength) {
     if (!macMatches(source, CydGatewayMac) ||
         (dataLength != sizeof(Packet) && dataLength != sizeof(CalibrationCommand) &&
-         dataLength != sizeof(ReportingCommand))) {
+         dataLength != sizeof(ReportingCommand) && dataLength != sizeof(SlewCommand))) {
         return;
     }
 
@@ -587,7 +590,28 @@ void requestTrueAzimuth(float trueAzimuth) {
                   targetMechanicalDeg);
 }
 
+void notifySlew(uint32_t request, SlewPhase phase, SlewError error = SlewError::Ok) {
+    SlewReply reply{};
+    reply.node=NodeId; reply.request=request; reply.phase=uint8_t(phase); reply.error=uint8_t(error);
+    esp_now_send(CydGatewayMac,reinterpret_cast<const uint8_t*>(&reply),sizeof(reply));
+    emitSlewReply(reply,"node_serial");
+}
+
+void cancelScheduledMotion() {
+    for (auto& item:scheduledCommands) item.active=false;
+    slewQueue.cancel([](uint32_t request,SlewPhase phase) { notifySlew(request,phase); });
+}
+
+void handleSlew(const SlewCommand& command) {
+    if (command.node!=NodeId) return;
+    bool legacyPending=false;
+    for (const auto& item:scheduledCommands) legacyPending |= item.active;
+    const auto error=slewQueue.add(command,utcClock.at(uint64_t(esp_timer_get_time())/1000),legacyPending);
+    notifySlew(command.request,error==SlewError::Ok ? SlewPhase::Queued : SlewPhase::Rejected,error);
+}
+
 bool queueAzimuth(uint32_t executeAtEpochSeconds, int16_t azimuthDeciDegrees) {
+    if (slewQueue.pending()) return false;
     for (ScheduledCommand& item : scheduledCommands) {
         if (!item.active) {
             item.active = true;
@@ -604,6 +628,9 @@ void serviceQueuedCommands() {
         return;
     }
     const uint32_t now = epochNow();
+    slewQueue.poll(utcClock.at(uint64_t(esp_timer_get_time())/1000),
+        [](float bearing) { requestTrueAzimuth(bearing); },
+        [](uint32_t request,SlewPhase phase) { notifySlew(request,phase); });
     for (ScheduledCommand& item : scheduledCommands) {
         if (item.active && static_cast<int32_t>(now - item.executeAtEpochSeconds) >=
                                0) {
@@ -683,9 +710,11 @@ void handleCommand(const Packet& packet) {
     const auto command = static_cast<CommandType>(packet.commandType);
     switch (command) {
         case CommandType::SetAzimuth:
+            cancelScheduledMotion();
             requestTrueAzimuth(packet.commandValueDeciDegrees / 10.0F);
             break;
         case CommandType::StepAzimuth:
+            cancelScheduledMotion();
             requestTrueAzimuth(trueAzimuthDeg() +
                                 packet.commandValueDeciDegrees / 10.0F);
             break;
@@ -706,6 +735,7 @@ void handleCommand(const Packet& packet) {
                           overlapSouthTrueDeg);
             break;
         case CommandType::Stop:
+            cancelScheduledMotion();
             stopModel();
             Serial.println("MODEL stop");
             break;
@@ -720,6 +750,10 @@ void processReceivedPackets() {
         const ReceivedPacket received = receiveQueue[receiveQueueReadIndex];
         receiveQueueReadIndex =
             (receiveQueueReadIndex + 1) % ReceiveQueueSize;
+        if (received.length == sizeof(SlewCommand)) {
+            SlewCommand command{}; memcpy(&command,received.payload,sizeof(command));
+            handleSlew(command); continue;
+        }
         if (received.length == sizeof(ReportingCommand)) {
             ReportingCommand command{};
             memcpy(&command, received.payload, sizeof(command));
@@ -758,6 +792,8 @@ void emitSerialCommandResult(const SerialRotatorCommand& command,
 }
 
 void handleSerialJson(char* line) {
+    SlewCommand slew{};
+    if (parseSlewCommand(line,&slew)) { handleSlew(slew); return; }
     ReportingCommand reportingCommand{};
     if (parseReportingCommand(line, &reportingCommand)) {
         handleReportingCommand(reportingCommand);
@@ -852,7 +888,7 @@ void loop() {
     digitalWrite(BuiltInLedPin, modelButtonPressed ? HIGH : LOW);
 
     const uint32_t nowMs = millis();
-    const bool moving = isMoving();
+    const bool moving = isMoving() || slewQueue.running();
     float unexpectedTurn = NAN;
 #ifdef ANTENNA_NODE_HAS_LSM303AGR
     float correctedMag[3], correctedAccel[3];

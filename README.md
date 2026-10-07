@@ -10,6 +10,15 @@ connected over ESP-NOW, node firmware, and a host-side control adapter.
 
 ## Current development snapshot — 2026-10-07
 
+Scheduled `goto`/`point` now accept a UTC start followed by polynomial bearing
+coefficients, optional `dur` seconds (default 30) and `step` increments (default
+3). Single-bearing commands remain immediate. Plans execute on the remote
+nodes. See [scheduled slews](docs/scheduled-slews.md) for examples, limits,
+cancellation and node acknowledgments. This requires protocol **6** on all
+three boards; the protocol-5 timing checkpoint below remains valid history.
+All three boards are flashed, and the short scheduled-slew hardware check
+passed. See [slew deployment results](docs/verification/2026-10-07-slews.md).
+
 The deployed timing increment uses filtered, bounded clock slewing and staggers
 periodic radio reports by node ID against UTC (uptime before synchronization).
 See [timekeeping and report slots](docs/timekeeping.md). It requires protocol

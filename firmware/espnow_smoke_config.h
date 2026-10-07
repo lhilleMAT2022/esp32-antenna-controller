@@ -14,7 +14,7 @@ constexpr uint8_t Channel = 1;
 constexpr uint32_t TimeSyncPeriodMs = 3000;
 constexpr uint32_t StatusPeriodMs = 1000;
 constexpr uint8_t AntennaNodeCount = 2;
-constexpr uint8_t ProtocolVersion = 5;
+constexpr uint8_t ProtocolVersion = 6;
 constexpr int8_t RssiUnavailable = 127;
 constexpr int16_t NoAzimuthDeciDegrees = -1;
 

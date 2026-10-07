@@ -1,6 +1,6 @@
 # Disciplined UTC and staggered reports
 
-Implemented 2026-10-07, wire protocol **5**. CYD and both remote nodes require
+Implemented 2026-10-07, wire protocol **6** (clock discipline introduced in protocol 5). CYD and both remote nodes require
 matching firmware. No additional time-sync traffic is introduced.
 
 ## Clock behavior
@@ -79,7 +79,7 @@ sensor reports are introduced during stationary quiet operation.
 The protocol-5 status/command/time packet is **62 bytes**. It appends
 `clockErrorMs:i32, clockRatePpm:i16, clockState:u8` to the protocol-4 55-byte
 layout. Other packet sizes remain unchanged. The node receive buffer is
-64 bytes. Serial `rp` and gateway `gs` add `sync_error_ms`, `sync_rate_ppm`,
+70 bytes in protocol 6 to accommodate scheduled-slew commands. Serial `rp` and gateway `gs` add `sync_error_ms`, `sync_rate_ppm`,
 `sync_state`. `sync_step_ms` remains the last actual step (zero for startup).
 `antenna_state` UDP schema remains 1.1.0: these new diagnostics are local to
 the TUI/serial protocol.

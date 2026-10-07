@@ -2,6 +2,12 @@
 
 ## Overview
 
+Manual `goto` and `point` accept either one immediate bearing or a scheduled
+polynomial: `point <UTC epoch s> C [X1 X2 ...] [dur seconds] [step count]`;
+`goto` additionally takes the node ID. Defaults are 30 seconds and 3 increments.
+Use **Log: Slew** for node acceptance and lifecycle replies. See
+[scheduled slews](docs/scheduled-slews.md) for exact target times and cancellation.
+
 Clock diagnostics now include disciplined-clock state, signed rate correction
 in ppm, filtered phase error, and last actual time step. See
 [timekeeping](docs/timekeeping.md) for slew limits and staggered report slots.

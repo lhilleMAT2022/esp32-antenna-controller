@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import secrets
 import math
 import os
 import platform
@@ -26,6 +27,7 @@ from typing import Any, Callable
 
 from .calibration import CalibrationManager, FACES
 from .runtime import MODE_TIMEOUTS, MODES, ReportingControl
+from .slew import SlewPlan, SLEW_ERRORS
 
 LOGGER = logging.getLogger("antenna_controller")
 SERIAL_BAUD = 115200
@@ -63,6 +65,8 @@ def parse_board_line(line: str | bytes) -> dict[str, Any] | None:
         "rm",
         "gt",
         "gs",
+        "sc",
+        "sa",
     }:
         return None
     return message
@@ -703,6 +707,8 @@ class AntennaController:
         self.calibration = CalibrationManager(self._send_calibration, self._report_calibration)
         self.reporting = ReportingControl(self._send_calibration, self._report_reporting)
         self.pending_capture: list[str] | None = None
+        self.slew_pending: dict[tuple[int, int], float] = {}
+        self.slew_lock = threading.RLock()
         self.gateway_status: dict[str, Any] = {}
         self._stop = threading.Event()
         self._server = self._make_command_server(command_host, command_port)
@@ -804,6 +810,15 @@ class AntennaController:
     def _handle_board_message(
         self, message: dict[str, Any], route: str
     ) -> None:
+        if message.get("t") == "sa":
+            key = (message.get("n"), message.get("q"))
+            with self.slew_lock:
+                self.slew_pending.pop(key, None)
+            error = message.get('e', 0)
+            detail = SLEW_ERRORS.get(error, f"error {error}")
+            self._record_event("SLEW", f"N{key[0]} plan {key[1]}: {message.get('phase')} ({detail})",
+                               source=f"node{key[0]}", route=route)
+            return
         if message.get("t") == "gs":
             self.gateway_status = dict(message, received_utc_ms=int(time.time()*1000), received_monotonic=time.monotonic())
             return
@@ -1000,6 +1015,28 @@ class AntennaController:
         )
         return route
 
+    def schedule_slew(self, nodes: tuple[int, ...], plan: SlewPlan) -> str:
+        if any(node not in (1, 2) for node in nodes) or not nodes:
+            raise ValueError("Node must be 1 or 2")
+        if plan.start_utc_s < time.time()+1:
+            raise ValueError("Scheduled UTC start must be at least one second in the future")
+        # Validate routes for the complete request before sending either node.
+        routes = [(node, *self._select_route(node)) for node in nodes]
+        request = secrets.randbelow(0xffffffff)+1
+        failures = []
+        with self.slew_lock:
+            for node, route, endpoint in routes:
+                key = (node, request)
+                self.slew_pending[key] = time.monotonic()+5
+                if not endpoint.send(plan.message(node, request)):
+                    self.slew_pending.pop(key, None)
+                    failures.append(f"N{node} {route} write failed")
+        self._record_event("SLEW", f"Requested plan {request}: UTC {plan.start_utc_s}, {plan.duration_s}s, {plan.steps} increments, nodes {nodes}",
+                           source="operator", route="command")
+        if failures:
+            raise RuntimeError("; ".join(failures)+"; other nodes may have accepted the plan; check SLEW replies")
+        return f"Requested UTC slew {request}: {plan.duration_s}s / {plan.steps} increments; wait for each node's SLEW acknowledgment"
+
     def handle_antenna_command(
         self, message: dict[str, Any], *, external: bool = False
     ) -> dict[str, Any]:
@@ -1078,6 +1115,12 @@ class AntennaController:
 
     def _time_sync_loop(self) -> None:
         while not self._stop.is_set():
+            with self.slew_lock:
+                for key, deadline in list(self.slew_pending.items()):
+                    if time.monotonic() > deadline:
+                        self.slew_pending.pop(key)
+                        self._record_event("SLEW", f"N{key[0]} plan {key[1]} acknowledgment timed out; outcome unknown",
+                                           source=f"node{key[0]}", route="command")
             self._service_pending_capture()
             message = {"t": "gt", "utc_ms": int(time.time()*1000)}
             if self.primary.connected.is_set():
@@ -1146,13 +1189,13 @@ class PiSerialRelay:
             def handle(self) -> None:
                 for raw in self.rfile:
                     message = parse_board_line(raw)
-                    if message is None or message.get("t") not in {"rc", "cc"}:
+                    if message is None or message.get("t") not in {"rc", "cc", "rm", "gt", "sc"}:
                         self.wfile.write(
                             json_line(
                                 {
                                     "t": "ra",
                                     "e": 1,
-                                    "detail": "expected compact rc or cc JSON",
+                                    "detail": "expected compact rc, cc, rm, gt or sc JSON",
                                 }
                             )
                         )

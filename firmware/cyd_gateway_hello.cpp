@@ -14,6 +14,7 @@
 #include "calibration_protocol.h"
 #include "receive_freshness.h"
 #include "runtime_protocol.h"
+#include "slew_protocol.h"
 
 namespace {
 using namespace antenna_controller;
@@ -486,7 +487,7 @@ void onDataReceived(const uint8_t* sourceMac,
                     const uint8_t* data,
                     int dataLength) {
     if (dataLength != sizeof(Packet) && dataLength != sizeof(CalibrationReport) &&
-        dataLength != sizeof(SensorTelemetry)) {
+        dataLength != sizeof(SensorTelemetry) && dataLength != sizeof(SlewReply)) {
         return;
     }
     const uint8_t nextWriteIndex =
@@ -606,6 +607,16 @@ void processReceivedPackets() {
         const ReceivedPacket received = receiveQueue[receiveQueueReadIndex];
         receiveQueueReadIndex =
             (receiveQueueReadIndex + 1) % ReceiveQueueSize;
+
+        if (received.payloadLength == sizeof(SlewReply)) {
+            SlewReply reply{}; memcpy(&reply,received.payload,sizeof(reply));
+            if (reply.type==11 && reply.version==ProtocolVersion && nodeIndex(reply.node)>=0 &&
+                macMatches(received.sourceMac,antennaNodeMac(reply.node))) {
+                nodeStatus[nodeIndex(reply.node)].link.receive(millis());
+                emitSlewReply(reply,"espnow");
+            }
+            continue;
+        }
 
         if (received.payloadLength == sizeof(CalibrationReport)) {
             CalibrationReport report{};
@@ -835,6 +846,15 @@ void keypadKey(const char* key) {
 
 void handleSerialLine(char* line) {
     if (line[0] == '{') {
+        SlewCommand slew{};
+        if (parseSlewCommand(line,&slew)) {
+            if (esp_now_send(antennaNodeMac(slew.node),reinterpret_cast<const uint8_t*>(&slew),sizeof(slew))!=ESP_OK) {
+                SlewReply reply{}; reply.node=slew.node; reply.request=slew.request;
+                reply.phase=uint8_t(SlewPhase::Rejected); reply.error=255;
+                emitSlewReply(reply,"gateway_serial");
+            }
+            return;
+        }
         uint64_t utcMs = 0;
         if (parseClockCommand(line, &utcMs)) {
             const bool firstSync = !timeValid;

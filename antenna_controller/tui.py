@@ -17,6 +17,7 @@ from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane
+from .slew import SlewPlan, parse_bearing
 from textual_plotext import PlotextPlot
 
 from .runtime import utc_text, vector_text
@@ -38,6 +39,7 @@ LOG_FILTERS = (
     "error",
     "client",
     "calibration",
+    "slew",
 )
 
 
@@ -676,9 +678,12 @@ class AntennaControllerApp(App[None]):
             return self.controller.calibration_command(fields[1:])
         if fields[0] in ("report", "reporting") and len(fields) in (2, 3):
             return self.controller.set_reporting_mode(fields[1], int(fields[2]) if len(fields) == 3 else 0)
-        if fields[0] == "goto" and len(fields) == 3:
+        if fields[0] == "goto" and len(fields) >= 3:
+            bearing = parse_bearing(fields[2:])
+            if isinstance(bearing, SlewPlan):
+                return self.controller.schedule_slew((int(fields[1]),), bearing)
             route = self.controller._send_rotator_command(
-                int(fields[1]), "goto", azimuth_deg=float(fields[2])
+                int(fields[1]), "goto", azimuth_deg=bearing
             )
             return f"Node {fields[1]} goto accepted via {route}"
         if fields[0] == "step" and len(fields) == 3:
@@ -691,8 +696,10 @@ class AntennaControllerApp(App[None]):
                 int(fields[1]), "stop"
             )
             return f"Node {fields[1]} stop accepted via {route}"
-        if fields[0] == "point" and len(fields) == 2:
-            target = float(fields[1])
+        if fields[0] == "point" and len(fields) >= 2:
+            target = parse_bearing(fields[1:])
+            if isinstance(target, SlewPlan):
+                return self.controller.schedule_slew((1, 2), target)
             routes = [
                 self.controller._send_rotator_command(
                     node, "goto", azimuth_deg=target

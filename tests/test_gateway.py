@@ -16,6 +16,9 @@ class GatewayFreshnessTests(unittest.TestCase):
     def test_clock_discipline_and_staggered_slots(self):
         self.compile_and_run('timing_test.cpp')
 
+    def test_scheduled_slew_queue_and_protocol(self):
+        self.compile_and_run('slew_test.cpp')
+
     def compile_and_run(self, filename):
         compiler = shutil.which('g++')
         if not compiler and Path('C:/msys64/mingw64/bin/g++.exe').is_file():
