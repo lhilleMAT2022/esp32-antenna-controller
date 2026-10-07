@@ -5,7 +5,7 @@
 namespace antenna_controller {
 constexpr uint8_t SlewCoefficientCount = 6, SlewQueueSize = 4;
 struct __attribute__((packed)) SlewCommand {
-    uint8_t type = 10, node = 0, version = 6, count = 0;
+    uint8_t type = 10, node = 0, version = 7, count = 0;
     uint32_t request = 0;
     uint64_t startMs = 0;
     uint32_t durationMs = 30000;
@@ -16,7 +16,7 @@ static_assert(sizeof(SlewCommand) == 70, "Slew command layout changed");
 enum class SlewPhase : uint8_t { Queued, Started, TargetsSent, Cancelled, Rejected };
 enum class SlewError : uint8_t { Ok, Invalid, Unsynced, Past, Full, Overlap, Conflict, LegacyQueue };
 struct __attribute__((packed)) SlewReply {
-    uint8_t type = 11, node = 0, version = 6, phase = 0;
+    uint8_t type = 11, node = 0, version = 7, phase = 0;
     uint32_t request = 0;
     uint8_t error = 0;
 };
@@ -28,7 +28,7 @@ inline double slewBearing(const SlewCommand& command, uint16_t step) {
     return isfinite(result) ? fmod(fmod(result,360.0)+360.0,360.0) : NAN;
 }
 inline bool validSlew(const SlewCommand& command) {
-    if (command.type!=10 || command.version!=6 || command.node<1 || command.node>2 ||
+    if (command.type!=10 || command.version!=7 || command.node<1 || command.node>2 ||
         !command.request || !command.startMs || command.startMs>4102444800000ULL ||
         command.count<1 || command.count>SlewCoefficientCount || !command.durationMs ||
         command.durationMs>86400000 || !command.steps || command.steps>3600 ||

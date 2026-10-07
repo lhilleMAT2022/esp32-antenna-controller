@@ -12,8 +12,8 @@ static_assert(sizeof(ReportingCommand) == 12, "Reporting command layout changed"
 
 inline bool validReportingCommand(const ReportingCommand& command) {
     return command.type == 8 && command.version == ProtocolVersion &&
-        command.node >= 1 && command.node <= AntennaNodeCount && command.request && command.mode <= 2 &&
-        (command.mode == 2 ? command.durationSeconds > 0 && command.durationSeconds <= MaxQuietSeconds : command.durationSeconds == 0);
+        command.node >= 1 && command.node <= AntennaNodeCount && command.request && command.mode <= 3 &&
+        (command.mode >= 2 ? command.durationSeconds > 0 && command.durationSeconds <= MaxQuietSeconds : command.durationSeconds == 0);
 }
 struct ReportingRequests {
     ReportingCommand recent[8]{};
@@ -36,7 +36,7 @@ inline bool parseReportingCommand(const char* line, ReportingCommand* out) {
     if (deserializeJson(doc, line) || doc["t"] != "rm" || !doc["n"].is<uint8_t>() ||
         !doc["q"].is<uint32_t>() || !doc["mode"].is<const char*>() || !doc["duration_s"].is<uint32_t>()) return false;
     const char* mode = doc["mode"];
-    out->mode = !strcmp(mode, "continuous") ? 0 : !strcmp(mode, "normal") ? 1 : !strcmp(mode, "quiet") ? 2 : 255;
+    out->mode = !strcmp(mode, "continuous") ? 0 : !strcmp(mode, "normal") ? 1 : !strcmp(mode, "quiet") ? 2 : !strcmp(mode, "silent") ? 3 : 255;
     out->node = doc["n"]; out->request = doc["q"]; out->durationSeconds = doc["duration_s"];
     return validReportingCommand(*out);
 }
@@ -54,7 +54,8 @@ inline void emitJsonFrame(const JsonDocument& doc) {
     Serial.write(reinterpret_cast<const uint8_t*>(line), size+1);
 }
 inline void emitRuntimeStatus(const Packet& packet, const char* source,
-                              uint64_t gatewayRxMs = 0, int8_t gatewayRssi = RssiUnavailable) {
+                              uint64_t gatewayRxMs = 0, int8_t gatewayRssi = RssiUnavailable,
+                              uint32_t radioTx = 0, uint32_t radioSuppressed = 0) {
     JsonDocument doc;
     doc["t"] = "rp"; doc["n"] = packet.senderId; doc["q"] = packet.sequence;
     doc["ts"] = packet.epochSeconds; doc["ts_ms"] = packet.utcMilliseconds;
@@ -66,6 +67,9 @@ inline void emitRuntimeStatus(const Packet& packet, const char* source,
     doc["ack"] = packet.packetType == uint8_t(PacketType::CommandAcknowledgment) ? packet.commandType : 0;
     doc["mode"] = reportingName(ReportingMode(packet.reportingMode));
     doc["quiet_left_ms"] = packet.quietRemainingMs; doc["up_ms"] = packet.uptimeMs;
+    if (!strcmp(source, "node_serial")) {
+        doc["radio_tx"] = radioTx; doc["radio_suppressed"] = radioSuppressed;
+    }
     doc["sync_age_ms"] = packet.clockSyncAgeMs; doc["sync_step_ms"] = packet.clockCorrectionMs;
     doc["sync_error_ms"] = packet.clockErrorMs; doc["sync_rate_ppm"] = packet.clockRatePpm;
     doc["sync_state"] = clockStateName(packet.clockState);

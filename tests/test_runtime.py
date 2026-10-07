@@ -1,4 +1,5 @@
 import math
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +16,38 @@ def heartbeat(node=1, q=1, mode="normal", request=0, boot=123):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_silent_reports_and_ack_expectations(self):
+        from antenna_controller.slew import SlewPlan
+        controller = AntennaController('unused', command_port=0, state_port=0)
+        controller.primary.connected.set()
+        sent = []
+        controller.primary.send = lambda message: sent.append(message) or True
+        try:
+            with patch('antenna_controller.bridge.time.monotonic', return_value=100):
+                for node in (1, 2):
+                    controller._handle_board_message(dict(heartbeat(node, mode='silent'), quiet_left_ms=300000), 'gateway')
+            with patch('antenna_controller.bridge.time.monotonic', return_value=200), patch('antenna_controller.bridge.time.time', return_value=1791390000):
+                with patch.object(controller, 'state_socket') as udp:
+                    controller._publish_state(controller.states.snapshot()[0])
+                    published = json.loads(udp.sendto.call_args.args[0])
+                    self.assertEqual(published['reporting_mode'], 'silent')
+                    self.assertEqual(published['quiet_remaining_s'], 200)
+                self.assertTrue(controller.states.route_fresh(1, 'gateway'))
+                self.assertTrue(controller.radio_ack_suppressed(1, 'gateway'))
+                self.assertFalse(controller.radio_ack_suppressed(1, 'backup'))
+                result = controller.schedule_slew((1, 2), SlewPlan(1791390020, (300, -.5)))
+                self.assertIn('acceptance unconfirmed', result)
+                self.assertFalse(controller.slew_pending)
+                self.assertIn('acceptance unconfirmed', controller.calibration_command(['1', 'status']))
+                self.assertIsNone(controller.calibration.nodes[1].pending)
+            with patch('antenna_controller.bridge.time.monotonic', return_value=491):
+                self.assertFalse(controller.states.route_fresh(1, 'gateway'))
+            controller.set_reporting_mode('silent', 30)
+            self.assertEqual(sent[-1]['duration_s'], 30)
+        finally:
+            controller._server.server_close()
+            controller.state_socket.close()
+
     def test_mae_conventions_and_undefined_angles(self):
         magnitude, az, el = vector_mae([0, -1, 1])
         self.assertAlmostEqual(magnitude, math.sqrt(2))
@@ -44,7 +77,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_reporting_timeout_and_invalid_duration(self):
         control = ReportingControl(lambda *_: None, lambda *_: None)
-        for mode, seconds in [('quiet', 0), ('quiet', -1), ('quiet', 86401), ('normal', 1), ('quiet', 1.5)]:
+        for mode, seconds in [('quiet', 0), ('quiet', -1), ('quiet', 86401), ('normal', 1), ('quiet', 1.5), ('silent', 0), ('silent', -1), ('silent', 86401)]:
             with self.subTest(mode=mode, seconds=seconds), self.assertRaises(ValueError):
                 control.command(mode, seconds)
         with patch('antenna_controller.runtime.time.monotonic', return_value=1):

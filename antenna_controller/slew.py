@@ -1,6 +1,7 @@
 """Parse immediate bearings or UTC polynomial target schedules."""
 from dataclasses import dataclass
 import math
+import time
 
 MAX_COEFFICIENTS = 6
 MAX_STEPS = 3600
@@ -34,16 +35,24 @@ class SlewPlan:
 
 def parse_bearing(fields: list[str]) -> float | SlewPlan:
     if not fields:
-        raise ValueError("Provide a bearing, or <UTC epoch seconds> C [X1 X2 ...] [dur seconds] [step count]")
+        raise ValueError("Provide a bearing, or <UTC epoch seconds|+delay seconds> C [X1 X2 ...] [dur seconds] [step count]")
     if len(fields) == 1:
         bearing = float(fields[0])
         if not math.isfinite(bearing) or not 0 <= bearing < 360:
             raise ValueError("Immediate bearing must be in [0, 360)")
         return bearing
-    try:
-        start = int(fields[0])
-    except ValueError:
-        raise ValueError("Scheduled start must be an integer UTC epoch second") from None
+    if fields[0].startswith("+"):
+        delay = fields[0][1:]
+        if not delay.isascii() or not delay.isdecimal() or int(delay) < 1:
+            raise ValueError("Relative start must be + followed by a positive whole number of seconds")
+        # Resolve once for the complete plan, so point gives both nodes the
+        # same absolute start. Round up to avoid shortening the requested delay.
+        start = math.ceil(time.time()) + int(delay)
+    else:
+        try:
+            start = int(fields[0])
+        except ValueError:
+            raise ValueError("Scheduled start must be an integer UTC epoch second or +delay seconds") from None
     if not 1 <= start <= 4102444800:
         raise ValueError("Scheduled UTC start is outside the supported epoch range")
     coefficients = []

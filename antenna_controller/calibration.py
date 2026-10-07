@@ -431,6 +431,7 @@ class CalibrationManager:
         except Exception:
             s.pending = None
             raise
-        s.note = f"{operation} sent via {route}; waiting for NODE confirmation"
+        s.note = (f"{operation} sent via {route}; waiting for NODE confirmation" if s.pending else
+                  f"{operation} sent via {route}; silent mode suppresses radio ACK; acceptance unconfirmed")
         self.report(node, s.note)
         return s.note

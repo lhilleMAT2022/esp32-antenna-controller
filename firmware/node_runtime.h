@@ -5,13 +5,14 @@
 #include "clock_discipline.h"
 
 namespace antenna_controller {
-enum class ReportingMode : uint8_t { Continuous = 0, Normal = 1, Quiet = 2 };
+enum class ReportingMode : uint8_t { Continuous = 0, Normal = 1, Quiet = 2, Silent = 3 };
 constexpr uint32_t MaxQuietSeconds = 86400;
 constexpr float QuietTurnDegrees = 10.0F;
 constexpr float RuntimePi = 3.14159265358979323846F;
 
 inline const char* reportingName(ReportingMode mode) {
     return mode == ReportingMode::Continuous ? "continuous" :
+           mode == ReportingMode::Silent ? "silent" :
            mode == ReportingMode::Quiet ? "quiet" : "normal";
 }
 inline uint32_t heartbeatPeriod(ReportingMode mode, bool moving = false) {
@@ -19,7 +20,8 @@ inline uint32_t heartbeatPeriod(ReportingMode mode, bool moving = false) {
            mode == ReportingMode::Quiet ? (moving ? 10000 : 60000) :
            10000;
 }
-inline uint32_t linkTimeout(ReportingMode mode) {
+inline uint32_t linkTimeout(ReportingMode mode, uint32_t remainingMs = 0) {
+    if (mode == ReportingMode::Silent) return remainingMs + 90000;
     return mode == ReportingMode::Continuous ? 5000 :
            mode == ReportingMode::Quiet ? 90000 : 25000;
 }
@@ -103,10 +105,13 @@ struct ReportingPolicy {
     explicit ReportingPolicy(uint8_t node = 1) : nodeId(node) {}
     uint32_t remaining(uint32_t now) const {
         const uint32_t elapsed = now-quietStartedMs;
-        return mode == ReportingMode::Quiet && elapsed < quietDurationMs ? quietDurationMs-elapsed : 0;
+        return (mode == ReportingMode::Quiet || mode == ReportingMode::Silent) && elapsed < quietDurationMs ? quietDurationMs-elapsed : 0;
+    }
+    bool allowRadio(bool reportingReply = false) const {
+        return mode != ReportingMode::Silent || reportingReply;
     }
     bool set(ReportingMode next, uint32_t seconds, uint32_t now) {
-        if (uint8_t(next) > 2 || (next == ReportingMode::Quiet ? (!seconds || seconds > MaxQuietSeconds) : seconds != 0)) return false;
+        if (uint8_t(next) > 3 || ((next == ReportingMode::Quiet || next == ReportingMode::Silent) ? (!seconds || seconds > MaxQuietSeconds) : seconds != 0)) return false;
         mode = next; quietStartedMs = now; quietDurationMs = seconds*1000;
         lastSensorMs = now;
         heartbeatSlot.initialized = sensorSlot.initialized = false;
@@ -118,6 +123,15 @@ struct ReportingPolicy {
         const uint64_t time = utc ? utc : mono;
         const uint32_t generation = utc ? clockGeneration : 0;
         RadioReports result;
+        if (mode == ReportingMode::Silent) {
+            wasMoving = moving;
+            if (remaining(now)) return result;
+            // Start a full quiet interval when silence expires. No deferred
+            // command replies or slew lifecycle messages are replayed.
+            mode = ReportingMode::Quiet; quietStartedMs = now;
+            heartbeatSlot.initialized = sensorSlot.initialized = false;
+            result.modeChanged = result.heartbeat = result.sensor = true;
+        }
         if (mode == ReportingMode::Quiet && remaining(now) == 0) {
             mode = ReportingMode::Normal; quietDurationMs = 0;
             result.modeChanged = result.heartbeat = result.sensor = true;

@@ -5,3 +5,5 @@ __pycache__/
 *.py[cod]
 .venv/
 calibration_captures/
+antenna_commands_*.csv
+antenna_events_*.csv

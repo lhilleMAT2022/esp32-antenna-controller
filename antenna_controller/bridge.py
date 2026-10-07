@@ -26,8 +26,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .calibration import CalibrationManager, FACES
-from .runtime import MODE_TIMEOUTS, MODES, ReportingControl
+from .runtime import MODE_TIMEOUTS, MODES, ReportingControl, report_timeout
 from .slew import SlewPlan, SLEW_ERRORS
+from .command_history import CommandHistory, load_history
+from .event_log import EVENT_HISTORY_LIMIT
 
 LOGGER = logging.getLogger("antenna_controller")
 SERIAL_BAUD = 115200
@@ -310,6 +312,12 @@ class NodeStateStore:
             if max_age_s is None:
                 max_age_s = (MODE_TIMEOUTS.get(self.route_modes.get((node_id, route)), ROUTE_STALE_SECONDS)
                              if route == "gateway" else ROUTE_STALE_SECONDS)
+                state = self.nodes[node_id]
+                if route == "gateway" and state.reporting_mode == "silent":
+                    # Extend only to the reported timer boundary plus quiet's
+                    # grace interval, never invent fresh node telemetry.
+                    deadline = state.report_received_monotonic + report_timeout('silent', state.quiet_remaining_ms)
+                    return seen is not None and time.monotonic() <= deadline
         return seen is not None and time.monotonic() - seen <= max_age_s
 
     def route_age(self, node_id: int, route: str) -> float | None:
@@ -676,7 +684,10 @@ class AntennaController:
         prefer_backup_node2: bool = False,
         tui: bool = False,
         serial_settings: SerialSettings | None = None,
+        replay_entries: list | None = None,
     ) -> None:
+        self.commands = CommandHistory()
+        self.replay_entries = replay_entries or []
         self.states = NodeStateStore()
         self.instance_id = str(uuid.uuid4())
         self.sequence = 0
@@ -700,7 +711,7 @@ class AntennaController:
         self.tui = tui
         self.accept_external_commands = True
         self._event_sequence = 0
-        self._events: deque[dict[str, Any]] = deque(maxlen=500)
+        self._events: deque[dict[str, Any]] = deque(maxlen=EVENT_HISTORY_LIMIT)
         self._events_lock = threading.Lock()
         self._client_count = 0
         self._client_lock = threading.Lock()
@@ -741,6 +752,7 @@ class AntennaController:
         self._server.shutdown()
         self._server.server_close()
         self.state_socket.close()
+        self.commands.close()
 
     def run(self) -> None:
         if self.tui:
@@ -840,7 +852,7 @@ class AntennaController:
             return
         if message.get("t") == "rp":
             self.reporting.ingest(message)
-            self.calibration.observe_runtime(message, MODE_TIMEOUTS.get(state.reporting_mode, 3.5) if route == "gateway" else 3.5)
+            self.calibration.observe_runtime(message, report_timeout(state.reporting_mode, state.quiet_remaining_ms) if route == "gateway" else 3.5)
             self._service_pending_capture()
         self._publish_state(state)
         if message.get("t") == "rp":
@@ -904,7 +916,7 @@ class AntennaController:
             "node_last_heard_utc_ms": state.measured_utc_ms,
             "node_time_utc_ms": state.node_utc_ms,
             "reporting_mode": state.reporting_mode,
-            "quiet_remaining_s": max(0, math.ceil(state.quiet_remaining_ms/1000 - (time.monotonic()-state.report_received_monotonic))) if state.reporting_mode == "quiet" else 0,
+            "quiet_remaining_s": max(0, math.ceil(state.quiet_remaining_ms/1000 - (time.monotonic()-state.report_received_monotonic))) if state.reporting_mode in ("quiet", "silent") else 0,
             "node_cyd_offset_ms": state.node_cyd_offset_ms,
             "node_pc_offset_ms": state.node_pc_offset_ms,
         }
@@ -935,7 +947,16 @@ class AntennaController:
         route, endpoint = self._select_route(node_id)
         if not endpoint.send(message):
             raise RuntimeError(f"{route} calibration write failed")
+        self.commands.sent()
+        if message.get('t') == 'cc' and self.radio_ack_suppressed(node_id, route):
+            self.calibration.nodes[node_id].pending = None
         return route
+
+    def radio_ack_suppressed(self, node_id: int, route: str) -> bool:
+        with self.states.lock:
+            state = self.states.nodes[node_id]
+            return (route == 'gateway' and state.reporting_mode == 'silent' and
+                    time.monotonic() < state.report_received_monotonic + state.quiet_remaining_ms/1000)
 
     def _report_calibration(self, node_id: int, detail: str) -> None:
         self._record_event("CALIBRATION", detail, source=f"node{node_id}", route="calibration")
@@ -944,13 +965,18 @@ class AntennaController:
         self._record_event("REPORTING", detail, source=f"node{node_id}", route="reporting")
 
     def set_reporting_mode(self, mode: str, seconds: int = 0) -> str:
+        command = f"report {mode}" + (f" {seconds}" if mode in ("quiet", "silent") else "")
+        with self.commands.action(command):
+            return self._set_reporting_mode(mode, seconds)
+
+    def _set_reporting_mode(self, mode: str, seconds: int = 0) -> str:
         with self.reporting.lock:
             if mode != "continuous" and (self.pending_capture or any(s.mode for s in self.calibration.nodes.values())):
                 raise ValueError("Cancel active calibration captures before reducing the reporting rate")
             return self.reporting.command(mode, seconds)
 
     def calibration_command(self, fields: list[str]) -> str:
-        with self.reporting.lock:
+        with self.commands.action("cal " + " ".join(fields), local=True), self.reporting.lock:
             return self._calibration_command(fields)
 
     def _calibration_command(self, fields: list[str]) -> str:
@@ -993,6 +1019,20 @@ class AntennaController:
         delta_deg: float | None = None,
         execute_at_utc_s: int | None = None,
     ) -> str:
+        text = f"{command} {node_id}"
+        if command == "goto":
+            text += f" {execute_at_utc_s}" if execute_at_utc_s is not None else ""
+            text += f" {azimuth_deg}"
+        elif command == "step":
+            text += f" {delta_deg}"
+        with self.commands.action(text):
+            return self._write_rotator_command(node_id, command, azimuth_deg=azimuth_deg,
+                                               delta_deg=delta_deg, execute_at_utc_s=execute_at_utc_s)
+
+    def _write_rotator_command(
+        self, node_id: int, command: str, *, azimuth_deg: float | None = None,
+        delta_deg: float | None = None, execute_at_utc_s: int | None = None,
+    ) -> str:
         self.command_sequence += 1
         message = compact_rotator_command(
             node_id,
@@ -1005,6 +1045,7 @@ class AntennaController:
         route, endpoint = self._select_route(node_id)
         if not endpoint.send(message):
             raise RuntimeError(f"{route} route write failed")
+        self.commands.sent()
         LOGGER.info("sent node %d %s via %s", node_id, command, route)
         self._record_event(
             "COMMAND",
@@ -1016,6 +1057,13 @@ class AntennaController:
         return route
 
     def schedule_slew(self, nodes: tuple[int, ...], plan: SlewPlan) -> str:
+        target = "point" if nodes == (1, 2) else f"goto {nodes[0]}" if len(nodes) == 1 else "point"
+        command = f"{target} {plan.start_utc_s} " + " ".join(map(str, plan.coefficients))
+        command += f" dur {plan.duration_s} step {plan.steps}"
+        with self.commands.action(command):
+            return self._schedule_slew(nodes, plan)
+
+    def _schedule_slew(self, nodes: tuple[int, ...], plan: SlewPlan) -> str:
         if any(node not in (1, 2) for node in nodes) or not nodes:
             raise ValueError("Node must be 1 or 2")
         if plan.start_utc_s < time.time()+1:
@@ -1024,17 +1072,27 @@ class AntennaController:
         routes = [(node, *self._select_route(node)) for node in nodes]
         request = secrets.randbelow(0xffffffff)+1
         failures = []
+        silent_nodes = []
         with self.slew_lock:
             for node, route, endpoint in routes:
                 key = (node, request)
-                self.slew_pending[key] = time.monotonic()+5
+                if self.radio_ack_suppressed(node, route):
+                    silent_nodes.append(node)
+                else:
+                    self.slew_pending[key] = time.monotonic()+5
                 if not endpoint.send(plan.message(node, request)):
                     self.slew_pending.pop(key, None)
                     failures.append(f"N{node} {route} write failed")
+                else:
+                    self.commands.sent()
         self._record_event("SLEW", f"Requested plan {request}: UTC {plan.start_utc_s}, {plan.duration_s}s, {plan.steps} increments, nodes {nodes}",
                            source="operator", route="command")
         if failures:
             raise RuntimeError("; ".join(failures)+"; other nodes may have accepted the plan; check SLEW replies")
+        if silent_nodes:
+            detail = f"Requested UTC slew {request}; no radio ACK expected from silent nodes {silent_nodes}; acceptance unconfirmed"
+            self._record_event("SLEW", detail, source="operator", route="command")
+            return detail
         return f"Requested UTC slew {request}: {plan.duration_s}s / {plan.steps} increments; wait for each node's SLEW acknowledgment"
 
     def handle_antenna_command(
@@ -1075,6 +1133,10 @@ class AntennaController:
             return self._client_count
 
     def set_online(self, online: bool) -> None:
+        with self.commands.action("online" if online else "offline", local=True):
+            self._set_online(online)
+
+    def _set_online(self, online: bool) -> None:
         self.accept_external_commands = bool(online)
         self._record_event(
             "COMMAND",
@@ -1106,6 +1168,7 @@ class AntennaController:
                 {
                     "sequence": self._event_sequence,
                     "utc": time.time(),
+                    "elapsed_seconds": self.commands.elapsed(),
                     "type": event_type,
                     "source": source,
                     "route": route,
@@ -1355,6 +1418,7 @@ def build_parser() -> argparse.ArgumentParser:
     ac.add_argument("--backup-port", type=int, default=PI_RELAY_PORT)
     ac.add_argument("--prefer-backup-node2", action="store_true")
     ac.add_argument("--tui", action="store_true")
+    ac.add_argument("--command-file", help="replay a command-history CSV relative to startup (requires --tui)")
     _add_serial_options(ac)
 
     relay = subparsers.add_parser(
@@ -1374,6 +1438,14 @@ def main(argv: list[str] | None = None) -> int:
         return scan_serial_ports()
     if args.role is None:
         parser.error("a role is required unless --scan-serial is used")
+    replay_entries = []
+    if args.role == "ac" and args.command_file:
+        if not args.tui:
+            parser.error("--command-file requires --tui")
+        try:
+            replay_entries = load_history(args.command_file)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1399,5 +1471,6 @@ def main(argv: list[str] | None = None) -> int:
             prefer_backup_node2=args.prefer_backup_node2,
             tui=args.tui,
             serial_settings=serial_settings,
+            replay_entries=replay_entries,
         ).run()
     return 0

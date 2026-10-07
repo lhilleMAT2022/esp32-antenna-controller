@@ -8,6 +8,8 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.markup import escape
@@ -16,8 +18,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane
+from textual.widgets import Button, Footer, Header, HelpPanel, Input, RichLog, Select, Static, TabbedContent, TabPane
 from .slew import SlewPlan, parse_bearing
+from .command_history import CommandReplay, validate_command
+from .event_log import EVENT_HISTORY_LIMIT, dump_events, event_detail, parse_dump_path
 from textual_plotext import PlotextPlot
 
 from .runtime import utc_text, vector_text
@@ -41,6 +45,58 @@ LOG_FILTERS = (
     "calibration",
     "slew",
 )
+
+
+class CommandInput(Input):
+    """Shell-style recall without sending commands while browsing."""
+    BINDINGS = [Binding("up", "previous_command", "Previous command", show=False),
+                Binding("down", "next_command", "Next command", show=False)]
+    HELP = "Up/Down recalls commands; Enter sends. Left/Right edits text here. Escape closes help or dialogs."
+
+    def __init__(self, *args, history_source=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.commands = []
+        self.position = 0
+        self.draft = ""
+        self.history_source = history_source
+
+    def sync_history(self):
+        at_end = self.position == len(self.commands)
+        if self.history_source:
+            self.commands = self.history_source()
+        if at_end:
+            self.position = len(self.commands)
+
+    def reset_history_position(self):
+        self.sync_history()
+        self.position = len(self.commands)
+        self.draft = ""
+
+    def action_previous_command(self):
+        self.sync_history()
+        if not self.commands:
+            return
+        if self.position == len(self.commands):
+            self.draft = self.value
+        self.position = max(0, self.position - 1)
+        self.value = self.commands[self.position]
+        self.cursor_position = len(self.value)
+
+    def action_next_command(self):
+        self.sync_history()
+        self.position = min(len(self.commands), self.position + 1)
+        self.value = self.commands[self.position] if self.position < len(self.commands) else self.draft
+        self.cursor_position = len(self.value)
+
+
+class ClosableHelpPanel(HelpPanel):
+    def compose(self):
+        yield Button("Close keys (Esc)", id="close-key-help")
+        yield from super().compose()
+
+    @on(Button.Pressed, "#close-key-help")
+    def close_help(self):
+        self.remove()
 
 
 class CalibrationHelp(ModalScreen):
@@ -109,12 +165,13 @@ class ReportingDialog(ModalScreen):
 
     def compose(self):
         with Vertical(id="reporting-dialog"):
-            yield Static("[bold]Reporting mode — both nodes[/]\nContinuous: 1 Hz. Normal: 10 s, faster during motion.\nQuiet: 60 s heartbeat; duration required.")
-            yield Input(value="300", placeholder="Quiet duration in seconds (1..86400)", id="quiet-seconds")
+            yield Static("[bold]Reporting mode — both nodes[/]\nContinuous: 1 Hz. Normal: 10 s, faster during motion.\nQuiet: 60 s heartbeat. Silent: no node radio transmissions.\nSilent expires to Quiet for the same duration, then Normal.")
+            yield Input(value="300", placeholder="Quiet / Silent duration in seconds (1..86400)", id="quiet-seconds")
             with Horizontal():
                 yield Button("Continuous", id="mode-continuous")
                 yield Button("Normal", id="mode-normal")
                 yield Button("Quiet", id="mode-quiet")
+                yield Button("Silent", id="mode-silent")
 
     @on(Button.Pressed)
     def apply_mode(self, event):
@@ -122,7 +179,7 @@ class ReportingDialog(ModalScreen):
             return
         mode = event.button.id.removeprefix("mode-")
         try:
-            seconds = int(self.query_one("#quiet-seconds", Input).value) if mode == "quiet" else 0
+            seconds = int(self.query_one("#quiet-seconds", Input).value) if mode in ("quiet", "silent") else 0
             result = self.controller.set_reporting_mode(mode, seconds)
         except (ValueError, RuntimeError) as exc:
             self.notify(str(exc), severity="error")
@@ -220,6 +277,10 @@ class AntennaControllerApp(App[None]):
         height: 1fr;
     }
 
+    #command-history-log { height: 1fr; }
+    #history-controls { height: 3; }
+    #history-status { height: auto; max-height: 3; }
+
     TabPane {
         padding: 0;
     }
@@ -252,6 +313,7 @@ class AntennaControllerApp(App[None]):
     """
 
     BINDINGS = [
+        Binding("escape", "close_overlay", "Close help", priority=True),
         Binding("q", "quit", "Quit"),
         Binding("m", "cycle_mode", "Graph mode"),
         Binding("l,L", "toggle_lines", "Lines", key_display="L"),
@@ -283,6 +345,10 @@ class AntennaControllerApp(App[None]):
         self.log_filter = "all"
         self._last_state_stamp: tuple[int, int] = (0, 0)
         self._last_event_sequence = 0
+        self._displayed_events: deque[dict] = deque(maxlen=EVENT_HISTORY_LIMIT)
+        self._last_command_index = 0
+        self.replay = CommandReplay(controller.replay_entries, controller.commands)
+        self._replay_error_shown = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -330,11 +396,18 @@ class AntennaControllerApp(App[None]):
                     with TabPane("Calibration", id="calibration-tab"):
                         with VerticalScroll():
                             yield Static(id="calibration", classes="panel")
-            yield RichLog(id="raw-log", markup=True, wrap=False, highlight=False)
+                    with TabPane("Command History", id="command-history-tab"):
+                        with Horizontal(id="history-controls"):
+                            yield Button("Save CSV", id="save-command-history")
+                            yield Button("Cancel replay", id="cancel-replay", disabled=not self.replay.entries)
+                        yield Static(id="history-status", markup=False)
+                        yield RichLog(id="command-history-log", markup=False, wrap=True, highlight=False, auto_scroll=False)
+            yield RichLog(id="raw-log", markup=True, wrap=False, highlight=False, max_lines=EVENT_HISTORY_LIMIT)
         with Horizontal(id="command-bar"):
-            yield Input(
+            yield CommandInput(
+                history_source=self.controller.commands.recall_entries,
                 placeholder=(
-                    "Manual: goto 2 180 | step 2 -5 | stop 2 | point 90 | park"
+                    "Manual: goto 2 180 | point +20 300 -0.5 | quit | ↑/↓ history"
                 ),
                 id="command-input",
             )
@@ -345,7 +418,68 @@ class AntennaControllerApp(App[None]):
 
     def on_mount(self) -> None:
         self.set_interval(0.5, self.refresh_dashboard)
+        self.set_interval(0.05, self._service_replay)
         self.refresh_dashboard()
+
+    def _service_replay(self):
+        self.replay.tick(self._execute_manual_command)
+        if self.replay.error and self.replay.error != self._replay_error_shown:
+            self._replay_error_shown = self.replay.error
+            self.controller._record_event("ERROR", self.replay.error, source="replay", route="local")
+            self.notify(self.replay.error, title="Replay stopped", severity="error", timeout=15)
+
+    def _update_command_history(self):
+        log = self.query_one("#command-history-log", RichLog)
+        entries = self.controller.commands.entries(self._last_command_index)
+        at_bottom = log.scroll_y >= log.max_scroll_y
+        for entry in entries:
+            stamp = datetime.fromtimestamp(entry.utc, timezone.utc).strftime("%H:%M:%S")
+            log.write(f"{stamp} UTC  {entry.command}", scroll_end=at_bottom)
+        self._last_command_index += len(entries)
+        history = self.controller.commands
+        status = f"{self.replay.status()} | {history.filename}"
+        if history.save_error:
+            status = f"CSV SAVE ERROR: {history.save_error} | History retained in memory"
+        self.query_one("#history-status", Static).update(status)
+
+    @on(Button.Pressed, "#save-command-history")
+    def save_command_history(self):
+        try:
+            path = self.controller.commands.save()
+        except OSError as exc:
+            self.controller.commands.save_error = str(exc)
+            self.notify(str(exc), title="CSV save failed", severity="error")
+        else:
+            self.notify(str(path), title="Command history saved")
+
+    @on(Button.Pressed, "#cancel-replay")
+    def cancel_replay(self):
+        self.replay.cancelled = True
+        self.notify("Remaining CSV commands cancelled. Existing node plans continue.")
+
+    def check_action(self, action, parameters):
+        if action == "close_overlay":
+            return isinstance(self.screen, ModalScreen) or bool(self.screen.query(HelpPanel))
+        return super().check_action(action, parameters)
+
+    def action_close_overlay(self):
+        if isinstance(self.screen, ModalScreen):
+            self.screen.dismiss()
+        else:
+            self.action_hide_help_panel()
+
+    def action_show_help_panel(self):
+        if not self.screen.query(HelpPanel):
+            self.screen.mount(ClosableHelpPanel())
+
+    def action_command_palette(self):
+        super().action_command_palette()
+        self.notify("Press Escape to close the command palette.", timeout=3)
+
+    def action_quit(self):
+        with self.controller.commands.action("quit", local=True):
+            self.replay.cancelled = True
+        self.exit()
 
     def refresh_dashboard(self) -> None:
         # The timer can tick during teardown or while the help modal is active.
@@ -365,6 +499,7 @@ class AntennaControllerApp(App[None]):
         self._update_heartbeats()
         self._update_calibration(states)
         self._update_events()
+        self._update_command_history()
         self._update_plot()
 
     def _update_status(self, states: list["NodeState"]) -> None:
@@ -423,9 +558,11 @@ class AntennaControllerApp(App[None]):
                       if self.controller.states.route_fresh(state.node_id, route)]
             condition = "[green]MOVING[/]" if routes and state.moving else "[green]ONLINE[/]" if routes else "[red]LOST[/]"
             mode = state.reporting_mode
-            if mode == "quiet":
+            if mode in ("quiet", "silent"):
                 left = max(0, math.ceil(state.quiet_remaining_ms/1000 - (time.monotonic()-state.report_received_monotonic)))
                 mode += f" [{left}s left]" + (" awaiting report" if not left else "")
+                if state.reporting_mode == "silent" and left:
+                    condition = "[yellow]RADIO SILENT[/]"
             heading = "—" if state.heading_deg is None else f"{state.heading_deg:.1f}°"
             target = "—" if state.target_deg is None else f"{state.target_deg:.1f}°"
             age = time.monotonic()-state.report_received_monotonic if state.report_received_monotonic else None
@@ -482,6 +619,7 @@ class AntennaControllerApp(App[None]):
             event_type = str(event["type"]).lower()
             if self.log_filter != "all" and event_type != self.log_filter:
                 continue
+            self._displayed_events.append(event)
             color = {
                 "report": "green",
                 "sensor": "cyan",
@@ -497,7 +635,7 @@ class AntennaControllerApp(App[None]):
                 f"[dim]{stamp}[/] [{color}]{event['type']:<7}[/] "
                 f"[bold]{escape(str(event['source']))}[/] "
                 f"[dim]{escape(str(event['route']))}[/] "
-                f"{escape(str(event['detail']))}"
+                f"{escape(event_detail(event))}"
             )
 
     def _update_plot(self) -> None:
@@ -641,6 +779,7 @@ class AntennaControllerApp(App[None]):
             self.log_filter = event.value
             log = self.query_one("#raw-log", RichLog)
             log.clear()
+            self._displayed_events.clear()
             self._last_event_sequence = 0
             self._update_events()
 
@@ -653,7 +792,7 @@ class AntennaControllerApp(App[None]):
         self._submit_manual_command()
 
     def _submit_manual_command(self) -> None:
-        command_input = self.query_one("#command-input", Input)
+        command_input = self.query_one("#command-input", CommandInput)
         command = command_input.value.strip()
         if not command:
             return
@@ -661,16 +800,36 @@ class AntennaControllerApp(App[None]):
         try:
             result = self._execute_manual_command(command)
             self.notify(result, title="Antenna command", severity="information")
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.controller.commands.remember_rejected(command)
             self.controller._record_event(
                 "ERROR", str(exc), source="operator", route="local"
             )
             self.notify(str(exc), title="Command rejected", severity="error")
+        finally:
+            command_input.reset_history_position()
 
     def _execute_manual_command(self, command: str) -> str:
+        validate_command(command)
+        with self.controller.commands.action(command):
+            return self._dispatch_manual_command(command)
+
+    def _dispatch_manual_command(self, command: str) -> str:
+        if command.strip().split(maxsplit=1)[0].lower() == "dump":
+            filename = parse_dump_path(command)
+            path = Path(filename or f"antenna_events_{int(self.controller.commands.started_utc)}.csv").resolve()
+            if self.controller.commands.path and path == self.controller.commands.path.resolve():
+                raise ValueError("Choose a different file from the active command-history recording")
+            self._update_events()
+            with self.controller.commands.action(command, local=True):
+                count = dump_events(list(self._displayed_events), path)
+            return f"Saved {count} events (Log: {self.log_filter}) to {path}"
         fields = shlex.split(command.lower())
         if not fields:
             raise ValueError("empty command")
+        if fields == ["quit"]:
+            self.action_quit()
+            return "TUI exiting; nodes continue independently"
         if fields[0] == "cal":
             if len(fields) >= 2 and fields[1] in ("1", "2"):
                 self.calibration_node = int(fields[1])
@@ -720,7 +879,7 @@ class AntennaControllerApp(App[None]):
             return f"External commands {fields[0]}"
         raise ValueError(
             "use: goto <node> <deg>, step <node> <deg>, stop <node>, "
-            "point <deg>, park, online, or offline"
+            "point <deg>, park, online, offline, dump [filename], or quit"
         )
 
     def action_cycle_mode(self) -> None:
@@ -808,6 +967,11 @@ def run_textual_tui(controller: "AntennaController") -> None:
     for handler in console_handlers:
         root_logger.removeHandler(handler)
     root_logger.addHandler(tui_handler)
+    try:
+        controller.commands.start_csv()
+    except OSError as exc:
+        controller.commands.save_error = str(exc)
+        controller._record_event("ERROR", f"CSV recording unavailable: {exc}", source="history", route="local")
     controller.start()
     try:
         AntennaControllerApp(controller).run()

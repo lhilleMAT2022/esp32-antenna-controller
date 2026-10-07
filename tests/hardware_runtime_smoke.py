@@ -1,4 +1,4 @@
-"""Check disciplined UTC and staggered cadence on a stationary protocol-6 bench.
+"""Check disciplined UTC and staggered cadence on a stationary protocol-7 bench.
 
 Temporarily sets both nodes continuous, normal, then quiet for 66 seconds;
 leaves both normal. No reset, rotator, calibration apply/save/clear commands.
@@ -117,7 +117,7 @@ def main():
         evidence = stack.enter_context(open(args.output, 'w', encoding='utf-8'))
         bench = Bench(ports, evidence)
         initial = bench.collect(2)
-        assert any(r['message'].get('t') == 'gs' and r['message'].get('pv') == 6 for r in initial), 'CYD protocol 6 required'
+        assert any(r['message'].get('t') == 'gs' and r['message'].get('pv') == 7 for r in initial), 'CYD protocol 7 required'
         try:
             bench.mode('continuous')
             continuous = bench.collect(7)

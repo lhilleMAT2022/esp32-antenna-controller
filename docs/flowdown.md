@@ -12,7 +12,7 @@ system-engineering repository.
 | `Requirements.md`, SR-04 | Point both antennas to the commanded azimuth within a TBD tolerance, report achieved azimuth, and hold both stationary during capture. |
 | `ICD_Messages.md`, §3.2 | Input: `antenna_command` from RM to AC via TCP port 31988. |
 | `ICD_Messages.md`, §3.3 | Output: `antenna_state` broadcast via UDP port 31989. |
-| `ICD_Messages.md`, §3.4 | Protocol 4 packed ESP-NOW packets and compact serial JSON; acknowledged global reporting control, continuous/normal/quiet rates and UTC milliseconds. See [node runtime](node-runtime.md). |
+| `ICD_Messages.md`, §3.4 | Packed ESP-NOW packets and compact serial JSON; global reporting control and UTC time transfer. Protocol-7 silent mode and addressed broadcast are specified in [node runtime](node-runtime.md). |
 | `SiteGeometry.md` | Physical layout, antenna identities, known pointing, and calibration bearing constraints. |
 
 The upstream documents remain authoritative. Any proposed change to these

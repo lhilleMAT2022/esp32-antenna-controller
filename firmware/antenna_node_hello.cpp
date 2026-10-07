@@ -228,7 +228,7 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
 }
 
 void onDataReceived(const uint8_t* source, const uint8_t* data, int dataLength) {
-    if (!macMatches(source, CydGatewayMac) ||
+    if (!macMatches(source, CydGatewayMac) || !unwrapDownlink(data, dataLength, NodeId) ||
         (dataLength != sizeof(Packet) && dataLength != sizeof(CalibrationCommand) &&
          dataLength != sizeof(ReportingCommand) && dataLength != sizeof(SlewCommand))) {
         return;
@@ -268,6 +268,12 @@ bool initializeEspNow() {
     return esp_now_add_peer(&peerInfo) == ESP_OK;
 }
 
+uint32_t radioTxCount = 0, radioSuppressedCount = 0;
+void sendRadio(const void* data, size_t size, bool reportingReply = false) {
+    if (!reporting.allowRadio(reportingReply)) { ++radioSuppressedCount; return; }
+    if (esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(data), size) == ESP_OK) ++radioTxCount;
+}
+
 void sendPacket(PacketType packetType, CommandType command = CommandType::None,
                 bool radio = true, bool serialOutput = true,
                 uint32_t reportingRequest = 0, uint8_t reportingError = 0) {
@@ -292,8 +298,8 @@ void sendPacket(PacketType packetType, CommandType command = CommandType::None,
     packet.clockState = utcClock.state(now);
     packet.reportingRequest = reportingRequest; packet.reportingError = reportingError;
     packet.boot = calibrationBoot; packet.calibrationFlags = lastCalibrationFlags;
-    if (radio) esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
-    if (serialOutput) emitRuntimeStatus(packet, "node_serial");
+    if (radio) sendRadio(&packet, sizeof(packet), packetType == PacketType::ReportingAcknowledgment);
+    if (serialOutput) emitRuntimeStatus(packet, "node_serial", 0, RssiUnavailable, radioTxCount, radioSuppressedCount);
 }
 
 void handleReportingCommand(const ReportingCommand& command) {
@@ -437,7 +443,7 @@ void sendSensorTelemetry(bool radio = true, bool serialOutput = true) {
         rollValue,
         pitchValue};
 
-    if (radio) esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&telemetry), sizeof(telemetry));
+    if (radio) sendRadio(&telemetry, sizeof(telemetry));
     if (serialOutput) emitRawSensor(telemetry, "node_serial");
 }
 #endif
@@ -500,7 +506,7 @@ void sendCalibrationReport(uint32_t request = 0, uint8_t error = 0, bool radio =
     }
 #endif
     lastCalibrationFlags = report.flags;
-    if (radio) esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&report), sizeof(report));
+    if (radio) sendRadio(&report, sizeof(report));
     if (serialOutput) emitCalibrationJson(report, "node_serial");
 }
 
@@ -593,7 +599,7 @@ void requestTrueAzimuth(float trueAzimuth) {
 void notifySlew(uint32_t request, SlewPhase phase, SlewError error = SlewError::Ok) {
     SlewReply reply{};
     reply.node=NodeId; reply.request=request; reply.phase=uint8_t(phase); reply.error=uint8_t(error);
-    esp_now_send(CydGatewayMac,reinterpret_cast<const uint8_t*>(&reply),sizeof(reply));
+    sendRadio(&reply, sizeof(reply));
     emitSlewReply(reply,"node_serial");
 }
 

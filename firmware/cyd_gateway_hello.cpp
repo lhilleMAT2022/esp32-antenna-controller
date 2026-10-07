@@ -138,7 +138,7 @@ bool macMatches(const uint8_t* first, const uint8_t* second) {
 
 bool nodeOnline(uint8_t nodeId) {
     const int index = nodeIndex(nodeId);
-    return index >= 0 && nodeStatus[index].link.fresh(millis(), linkTimeout(nodeStatus[index].mode));
+    return index >= 0 && nodeStatus[index].link.fresh(millis(), linkTimeout(nodeStatus[index].mode, nodeStatus[index].quietRemainingMs));
 }
 
 bool sensorTelemetryFresh(uint8_t nodeId) {
@@ -271,10 +271,10 @@ void drawNodeCard(uint8_t nodeId, int y) {
     display.drawRoundRect(4, y, screenWidth() - 8, cardHeight, 6, TFT_WHITE);
     display.setTextColor(TFT_WHITE, online ? TFT_DARKGREY : TFT_MAROON);
     snprintf(line, sizeof(line), "NODE %u  %s", nodeId,
-             online ? "ONLINE" : "OFFLINE");
+             online && status.mode == ReportingMode::Silent ? "SILENT" : online ? "ONLINE" : "OFFLINE");
     display.drawString(line, 10, y + 4, 2);
 
-    if (moving && ((millis() / 500UL) % 2UL == 0UL)) {
+    if (moving && status.mode != ReportingMode::Silent && ((millis() / 500UL) % 2UL == 0UL)) {
         display.setTextColor(TFT_YELLOW, online ? TFT_DARKGREY : TFT_MAROON);
         display.drawRightString("* SLEWING", screenWidth() - 10, y + 4, 2);
     }
@@ -387,8 +387,8 @@ void drawDebugPanel() {
         char row[64];
         const uint32_t elapsed = millis()-sensor.lastModeMs;
         const uint32_t remaining = elapsed < sensor.quietRemainingMs ? (sensor.quietRemainingMs-elapsed+999)/1000 : 0;
-        if (sensor.mode == ReportingMode::Quiet)
-            snprintf(row, sizeof(row), "N%u %s quiet %lus | N>G %d dBm", node, nodeOnline(node) ? "ONLINE" : "OFFLINE", (unsigned long)remaining, sensor.rssiAtGateway);
+        if (sensor.mode == ReportingMode::Quiet || sensor.mode == ReportingMode::Silent)
+            snprintf(row, sizeof(row), "N%u %s %s %lus | N>G %d dBm", node, sensor.mode == ReportingMode::Silent ? "LAST" : nodeOnline(node) ? "ONLINE" : "OFFLINE", reportingName(sensor.mode), (unsigned long)remaining, sensor.rssiAtGateway);
         else snprintf(row, sizeof(row), "N%u %s %s | N>G %d dBm", node, nodeOnline(node) ? "ONLINE" : "OFFLINE", reportingName(sensor.mode), sensor.rssiAtGateway);
         display.setTextColor(TFT_YELLOW, TFT_BLACK);
         display.drawString(row, 4, top, 1);
@@ -469,7 +469,7 @@ void refreshNodeFreshness(uint32_t nowMs) {
     for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
         const int index = nodeIndex(nodeId);
         NodeStatus& status = nodeStatus[index];
-        const bool linkChanged = status.link.update(nowMs, linkTimeout(status.mode));
+        const bool linkChanged = status.link.update(nowMs, linkTimeout(status.mode, status.quietRemainingMs));
         const bool sensorChanged = status.sensor.update(nowMs, status.mode == ReportingMode::Quiet ? 90000 : status.mode == ReportingMode::Normal ? 25000 : SensorOfflineMs);
         if (linkChanged || sensorChanged) {
             nodeCardDirty[index] = true;
@@ -527,7 +527,18 @@ bool initializeEspNow() {
             return false;
         }
     }
-    return true;
+    esp_now_peer_info_t broadcast{};
+    memcpy(broadcast.peer_addr, BroadcastMac, 6);
+    broadcast.channel = Channel; broadcast.encrypt = false;
+    return esp_now_add_peer(&broadcast) == ESP_OK;
+}
+
+esp_err_t sendNodeMessage(uint8_t node, const void* payload, size_t size) {
+    if (!antennaNodeMac(node) || size > MaxDownlinkPayload) return ESP_ERR_INVALID_ARG;
+    uint8_t frame[DownlinkHeaderSize+MaxDownlinkPayload];
+    frame[0] = DownlinkType; frame[1] = node; frame[2] = ProtocolVersion;
+    memcpy(frame+DownlinkHeaderSize, payload, size);
+    return esp_now_send(BroadcastMac, frame, size+DownlinkHeaderSize);
 }
 
 void sendPacket(uint8_t nodeId,
@@ -550,8 +561,7 @@ void sendPacket(uint8_t nodeId,
         latestRssiForNode(nodeId)};
     packet.utcMilliseconds = utcMilliseconds();
     const esp_err_t result =
-        esp_now_send(antennaNodeMac(nodeId),
-                     reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+        sendNodeMessage(nodeId, &packet, sizeof(packet));
     Serial.printf("TX node %u %s %s\n", nodeId,
                   packetType == PacketType::TimeSync
                       ? "time-sync"
@@ -563,7 +573,7 @@ void sendTimeSync(bool force = false) {
     if (!timeValid) return;
     for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
         auto& status = nodeStatus[nodeIndex(nodeId)];
-        const uint32_t period = status.mode == ReportingMode::Quiet ? 60000 :
+        const uint32_t period = (status.mode == ReportingMode::Quiet || status.mode == ReportingMode::Silent) ? 60000 :
                                 status.mode == ReportingMode::Continuous ? 3000 : 10000;
         if (force || millis()-status.lastTimeSyncMs >= period) {
             sendPacket(nodeId, PacketType::TimeSync);
@@ -705,7 +715,7 @@ void processReceivedPackets() {
         status.flags = packet.flags;
         status.nodeEpochSeconds = packet.epochSeconds;
         status.nodeUtcMs = packet.utcMilliseconds;
-        if (packet.reportingMode <= 2) status.mode = ReportingMode(packet.reportingMode);
+        if (packet.reportingMode <= 3) status.mode = ReportingMode(packet.reportingMode);
         status.quietRemainingMs = packet.quietRemainingMs;
         status.lastModeMs = millis();
         status.link.receive(millis());
@@ -848,7 +858,7 @@ void handleSerialLine(char* line) {
     if (line[0] == '{') {
         SlewCommand slew{};
         if (parseSlewCommand(line,&slew)) {
-            if (esp_now_send(antennaNodeMac(slew.node),reinterpret_cast<const uint8_t*>(&slew),sizeof(slew))!=ESP_OK) {
+            if (sendNodeMessage(slew.node, &slew, sizeof(slew))!=ESP_OK) {
                 SlewReply reply{}; reply.node=slew.node; reply.request=slew.request;
                 reply.phase=uint8_t(SlewPhase::Rejected); reply.error=255;
                 emitSlewReply(reply,"gateway_serial");
@@ -865,13 +875,12 @@ void handleSerialLine(char* line) {
         }
         ReportingCommand reportingCommand{};
         if (parseReportingCommand(line, &reportingCommand)) {
-            esp_now_send(antennaNodeMac(reportingCommand.node), reinterpret_cast<const uint8_t*>(&reportingCommand), sizeof(reportingCommand));
+            sendNodeMessage(reportingCommand.node, &reportingCommand, sizeof(reportingCommand));
             return;
         }
         CalibrationCommand calibrationCommand{};
         if (parseCalibrationCommand(line, &calibrationCommand)) {
-            const esp_err_t result = esp_now_send(antennaNodeMac(calibrationCommand.node),
-                reinterpret_cast<const uint8_t*>(&calibrationCommand), sizeof(calibrationCommand));
+            const esp_err_t result = sendNodeMessage(calibrationCommand.node, &calibrationCommand, sizeof(calibrationCommand));
             // Only the node can acknowledge applying or saving calibration.
             if (result != ESP_OK) Serial.println("CAL gateway radio send failed");
             return;

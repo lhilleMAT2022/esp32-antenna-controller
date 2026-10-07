@@ -8,8 +8,12 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-MODES = ("continuous", "normal", "quiet")
-MODE_TIMEOUTS = {"continuous": 5.0, "normal": 25.0, "quiet": 90.0}
+MODES = ("continuous", "normal", "quiet", "silent")
+MODE_TIMEOUTS = {"continuous": 5.0, "normal": 25.0, "quiet": 90.0, "silent": 90.0}
+
+
+def report_timeout(mode, remaining_ms=0):
+    return MODE_TIMEOUTS.get(mode, 3.5) + (max(0, remaining_ms)/1000 if mode == 'silent' else 0)
 
 
 def vector_mae(vector: list[float] | None) -> tuple[float, float | None, float | None] | None:
@@ -57,9 +61,9 @@ class ReportingControl:
 
     def command(self, mode: str, seconds: int = 0) -> str:
         if mode not in MODES or isinstance(seconds, bool) or not isinstance(seconds, int):
-            raise ValueError("Use report continuous | report normal | report quiet <seconds>")
-        if (mode == "quiet" and not 1 <= seconds <= 86400) or (mode != "quiet" and seconds):
-            raise ValueError("Quiet needs a duration of 1..86400 seconds; other modes take no duration")
+            raise ValueError("Use report continuous | report normal | report quiet/silent <seconds>")
+        if (mode in ("quiet", "silent") and not 1 <= seconds <= 86400) or (mode not in ("quiet", "silent") and seconds):
+            raise ValueError("Quiet and Silent need a duration of 1..86400 seconds; other modes take no duration")
         with self.lock:
             self.expire()
             if self.pending:

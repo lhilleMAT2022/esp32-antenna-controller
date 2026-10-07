@@ -10,12 +10,36 @@ connected over ESP-NOW, node firmware, and a host-side control adapter.
 
 ## Current development snapshot — 2026-10-07
 
-Scheduled `goto`/`point` now accept a UTC start followed by polynomial bearing
+Protocol **7** adds `report silent <seconds>`: remote nodes execute moves and
+schedules without ESP-NOW reports or command ACKs. Reporting-mode commands
+remain acknowledged. Expiry starts quiet mode for the same duration, then
+normal. USB reporting continues. Addressed broadcast downlinks prevent
+hardware Wi-Fi ACKs to CYD traffic. See [node runtime](docs/node-runtime.md).
+Manual Up/Down recall now includes commands from arrow keys, reporting
+controls, calibration, and external clients, preserving repeated steps.
+All three boards are flashed and the live silent-mode check passed; the
+75-test regression set passes. See [deployment evidence](docs/verification/2026-10-07-silent.md).
+
+The TUI now has a scrollable **Command History** tab with UTC timestamps,
+automatic `antenna_commands_<startup_epoch>.csv` recording, and a Save CSV
+button. `--tui --command-file <file.csv>` replays commands at their recorded
+startup-relative times; a final `quit` exits the host TUI while nodes continue.
+Up/Down recalls manual entries. Escape closes the command palette and key
+guide; the guide also has a Close button. See
+[command recording and replay](docs/command-history.md).
+
+`dump [filename]` exports the right-hand event pane to CSV, respecting its
+current Log filter. The default is `antenna_events_<startup_epoch>.csv`.
+The controller retains 10,000 events; the pane retains 10,000 lines, evicting
+the oldest entries. See [event log export](docs/command-history.md#event-log-export).
+
+Scheduled `goto`/`point` now accept a UTC start (or `+seconds` from now,
+resolved by the TUI) followed by polynomial bearing
 coefficients, optional `dur` seconds (default 30) and `step` increments (default
 3). Single-bearing commands remain immediate. Plans execute on the remote
 nodes. See [scheduled slews](docs/scheduled-slews.md) for examples, limits,
-cancellation and node acknowledgments. This requires protocol **6** on all
-three boards; the protocol-5 timing checkpoint below remains valid history.
+cancellation and node acknowledgments. Slews were introduced in protocol **6**;
+all three boards now require protocol **7**. The older timing checkpoint below remains valid history.
 All three boards are flashed, and the short scheduled-slew hardware check
 passed. See [slew deployment results](docs/verification/2026-10-07-slews.md).
 

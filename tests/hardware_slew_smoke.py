@@ -34,7 +34,7 @@ def main():
             stack.callback(port.close); ports[name]=port
         bench=Bench(ports,stack.enter_context(open(args.output,'w',encoding='utf-8')))
         initial=bench.collect(3)
-        assert any(r['message'].get('t')=='gs' and r['message'].get('pv')==6 for r in initial)
+        assert any(r['message'].get('t')=='gs' and r['message'].get('pv')==7 for r in initial)
         try:
             bench.mode('continuous')
             request=secrets.randbelow(0xffffff00)+1

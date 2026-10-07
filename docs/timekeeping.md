@@ -1,6 +1,6 @@
 # Disciplined UTC and staggered reports
 
-Implemented 2026-10-07, wire protocol **6** (clock discipline introduced in protocol 5). CYD and both remote nodes require
+Implemented 2026-10-07, wire protocol **7** (clock discipline introduced in protocol 5). CYD and both remote nodes require
 matching firmware. No additional time-sync traffic is introduced.
 
 ## Clock behavior

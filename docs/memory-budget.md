@@ -1,12 +1,12 @@
 # ESP32 memory budget — 2026-10-07
 
-Protocol-6 firmware, from successful PlatformIO builds:
+Protocol-7 firmware, from successful PlatformIO builds:
 
 | Target | Code + read-only data | Application limit | Used | App space remaining | Static data RAM |
 |---|---:|---:|---:|---:|---:|
-| CYD | 835,889 bytes | 1,310,720 bytes | 63.8% | 474,831 bytes | 46,424 / 327,680 bytes (14.2%) |
-| Node 1 | 809,849 bytes | 1,310,720 bytes | 61.8% | 500,871 bytes | 46,836 / 327,680 bytes (14.3%) |
-| Node 2 | 809,865 bytes | 1,310,720 bytes | 61.8% | 500,855 bytes | 46,836 / 327,680 bytes (14.3%) |
+| CYD | 836,405 bytes | 1,310,720 bytes | 63.8% | 474,315 bytes | 46,424 / 327,680 bytes (14.2%) |
+| Node 1 | 810,229 bytes | 1,310,720 bytes | 61.8% | 500,491 bytes | 46,844 / 327,680 bytes (14.3%) |
+| Node 2 | 810,245 bytes | 1,310,720 bytes | 61.8% | 500,475 bytes | 46,844 / 327,680 bytes (14.3%) |
 
 Each board has **4 MiB (4,194,304 bytes) of flash**. The default ESP32 partition
 layout gives each application slot **1.25 MiB**; there are two slots for OTA,
@@ -32,3 +32,7 @@ or calibration-storage changes were made.
 
 The scheduled-slew increment added about 4.3 KiB of code on CYD and 5.5 KiB
 on each node, plus 912 bytes of node static RAM for queue/replay state.
+
+Silent mode and addressed broadcast add 516 bytes of CYD code and 380 bytes
+of node code over protocol 6; node static RAM grows by 8 bytes for transmit
+diagnostic counters. CYD static RAM is unchanged.

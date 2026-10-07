@@ -14,7 +14,18 @@ constexpr uint8_t Channel = 1;
 constexpr uint32_t TimeSyncPeriodMs = 3000;
 constexpr uint32_t StatusPeriodMs = 1000;
 constexpr uint8_t AntennaNodeCount = 2;
-constexpr uint8_t ProtocolVersion = 6;
+constexpr uint8_t ProtocolVersion = 7;
+constexpr uint8_t BroadcastMac[6] = {255,255,255,255,255,255};
+constexpr uint8_t DownlinkType = 12;
+constexpr size_t DownlinkHeaderSize = 3, MaxDownlinkPayload = 70;
+
+// Addressed broadcast avoids hardware Wi-Fi ACK emissions by silent nodes.
+inline bool unwrapDownlink(const uint8_t*& data, int& size, uint8_t node) {
+    if (size < int(DownlinkHeaderSize) || size > int(DownlinkHeaderSize+MaxDownlinkPayload) ||
+        data[0] != DownlinkType || data[1] != node || data[2] != ProtocolVersion) return false;
+    data += DownlinkHeaderSize; size -= DownlinkHeaderSize;
+    return true;
+}
 constexpr int8_t RssiUnavailable = 127;
 constexpr int16_t NoAzimuthDeciDegrees = -1;
 

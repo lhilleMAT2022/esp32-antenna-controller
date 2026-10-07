@@ -2,7 +2,7 @@
 #include "runtime_protocol.h"
 #include "slew_plan.h"
 namespace antenna_controller {
-static_assert(ProtocolVersion == 6, "Update slew protocol version with wire protocol");
+static_assert(ProtocolVersion == 7, "Update slew protocol version with wire protocol");
 inline bool parseSlewCommand(const char* line, SlewCommand* out) {
     JsonDocument doc;
     if (deserializeJson(doc,line) || doc["t"]!="sc" || !doc["n"].is<uint8_t>() ||

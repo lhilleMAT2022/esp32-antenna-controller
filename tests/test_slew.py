@@ -9,6 +9,22 @@ from antenna_controller.slew import SlewPlan, parse_bearing
 
 
 class SlewTests(unittest.TestCase):
+    def test_relative_start_resolves_to_absolute_utc_once(self):
+        for now, expected in ((1791395489.0, 1791395509), (1791395489.75, 1791395510)):
+            with self.subTest(now=now), patch('antenna_controller.slew.time.time', return_value=now) as clock:
+                plan = parse_bearing('+20 300 -0.5 dur 60 step 30'.split())
+                self.assertEqual(plan.start_utc_s, expected)
+                self.assertEqual((plan.duration_s, plan.steps), (60, 30))
+                self.assertEqual(plan.message(1, 42)['at'], expected)
+                self.assertEqual(plan.message(2, 42)['at'], expected)
+                clock.assert_called_once_with()
+        self.assertEqual(parse_bearing(['+20']), 20)
+
+    def test_invalid_relative_starts(self):
+        for start in ('+', '+0', '+-1', '++20', '+1.5', '+nan', '+inf', '+1e2', '+99999999999'):
+            with self.subTest(start=start), self.assertRaises(ValueError):
+                parse_bearing([start, '300'])
+
     def test_relay_forwards_slew_reporting_and_clock_commands(self):
         relay = PiSerialRelay('unused', listen_host='127.0.0.1', listen_port=0)
         received = []

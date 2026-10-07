@@ -7,6 +7,9 @@ import unittest
 
 
 class GatewayFreshnessTests(unittest.TestCase):
+    def test_silent_policy_timers_and_addressed_broadcast(self):
+        self.compile_and_run('silent_test.cpp')
+
     def test_boot_timeout_recovery_and_timer_wrap(self):
         self.compile_and_run('link_freshness_test.cpp')
 

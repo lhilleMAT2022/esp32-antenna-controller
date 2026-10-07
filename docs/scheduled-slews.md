@@ -15,7 +15,21 @@ point <start_epoch_s> C [X1 X2 ...] [dur <seconds>] [step <count>]
 goto <node> <start_epoch_s> C [X1 X2 ...] [dur <seconds>] [step <count>]
 ```
 
-The start is an **absolute integer UTC epoch second**, not a relative delay.
+The start accepts an **absolute integer UTC epoch second** or **`+seconds`**
+for a positive whole-number delay from the host PC's current UTC time.
+The TUI resolves a relative start once, rounding up to the next whole UTC
+second when necessary, and sends the same absolute timestamp to both nodes
+for `point`. No firmware or protocol change is needed. For example:
+
+```text
+point +20 300 -0.5
+goto 2 +20 0 2 dur 60 step 30
+```
+
+These begin in 20 to less than 21 seconds. A lone `point +20` still means
+an immediate bearing of 20°; include the initial bearing after the delay
+to schedule a move.
+
 It must be at least one second in the future when submitted by the host, and
 still future when accepted by the node. Defaults are `dur 30 step 3`.
 
@@ -51,6 +65,8 @@ The whole plan is sent once to each node. It executes from the node's UTC
 clock even if the host disconnects; there are no per-step RF commands. Existing
 normal/quiet reporting schedules still apply. Planned movement reporting stays
 active throughout a running plan, including pauses between target updates.
+Silent mode executes plans with no radio reports or lifecycle ACKs. Direct USB
+diagnostics continue; radio submission during silence has unconfirmed acceptance.
 
 Each target invokes the existing position controller. This is a stepped target
 schedule, not a guarantee of constant physical angular velocity or arrival at
@@ -85,7 +101,9 @@ already-issued increment. Startup without valid UTC rejects scheduled work.
 
 ## Transport contract
 
-Protocol **6** requires matched CYD and node firmware. The existing status
+Protocol **7** requires matched CYD and node firmware. CYD downlinks add the
+three-byte addressed-broadcast envelope specified in [node runtime](node-runtime.md).
+The existing status
 Packet remains 62 bytes. New packed little-endian messages:
 
 - Type 10, 70-byte `SlewCommand`: `type:u8,node:u8,version:u8,count:u8,
