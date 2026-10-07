@@ -26,7 +26,13 @@ waits for their acknowledgments.
 
 Protocol **4 requires updating CYD and both remote nodes together**. The
 runtime increment has passed 44 host/native/TUI tests and all three firmware
-builds; hardware deployment and acceptance for this increment are pending.
+builds. CYD (COM10), node 1 (COM11), and node 2 (COM7) were flashed and verified
+on 2026-10-07. The hardware check passed continuous/normal/quiet RF cadence,
+quiet expiry, UTC synchronization, and 1 Hz USB telemetry in every mode.
+Both nodes have valid accelerometer and magnetometer readings (`sf=15`) and
+are left in normal reporting. The live TUI check passed both-node displays,
+UTC, mode acknowledgments and quiet countdown. See the
+[deployment evidence](docs/verification/2026-10-07-runtime.md).
 Physical relay actuation and calibration save/power-cycle acceptance remain
 unfinished. See [node runtime specification](docs/node-runtime.md) for rates,
 wire fields, clock interpretation and verification. The snapshots below are
