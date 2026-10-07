@@ -3,14 +3,6 @@
 using namespace antenna_controller;
 
 int main() {
-    UtcClock clock;
-    assert(clock.at(5000) == 0);
-    clock.synchronize(1791378000123ULL, 5000);
-    assert(clock.at(6234) == 1791378001357ULL);
-    clock.synchronize(1791378001367ULL, 6234);
-    assert(clock.correctionMs == 10 && clock.syncAge(7234) == 1000);
-    assert(clock.at(uint64_t(UINT32_MAX)+10000) == 1791378001367ULL + uint64_t(UINT32_MAX)+10000-6234);
-
     auto mae = vectorMae(0, -1, 1);
     assert(fabsf(mae.magnitude-sqrtf(2)) < 1e-5F && fabsf(mae.azimuth-270) < 1e-5F && fabsf(mae.elevation-45) < 1e-5F);
     assert(isnan(vectorMae(0, 0, 0).azimuth));
@@ -27,40 +19,6 @@ int main() {
     assert(isnan(orientation.change(zero, turned)));
 
     ReportingPolicy policy;
-    auto reports = policy.poll(0, false, 0);
-    assert(reports.heartbeat && reports.sensor && policy.mode == ReportingMode::Normal);
-    assert(!policy.poll(9999, false, 0).heartbeat);
-    assert(policy.poll(10000, false, 0).sensor);
-    reports = policy.poll(11000, true, 0);
-    assert(reports.sensor && !reports.heartbeat); // normal-mode heartbeat stays at 10 s
-    reports = policy.poll(11100, false, 0);
-    assert(reports.heartbeat && reports.sensor);
-    assert(!policy.set(ReportingMode::Quiet, 0, 0));
-    assert(!policy.set(ReportingMode::Normal, 10, 0));
-    assert(policy.set(ReportingMode::Quiet, 300, 20000));
-    reports = policy.poll(79000, false, 10);
-    assert(!reports.heartbeat && !reports.sensor);
-    reports = policy.poll(80000, false, 10);
-    assert(reports.heartbeat && !reports.sensor);
-    reports = policy.poll(81000, false, 10.1F);
-    assert(reports.sensor && !reports.heartbeat);
-    reports = policy.poll(82000, true, 45);
-    assert(!reports.heartbeat && !reports.sensor);
-    reports = policy.poll(92000, true, 45);
-    assert(reports.heartbeat && reports.sensor);
-    reports = policy.poll(92500, false, 0);
-    assert(reports.heartbeat && reports.sensor && policy.mode == ReportingMode::Quiet);
-    assert(policy.remaining(92500) == 227500);
-    reports = policy.poll(320000, false, 0);
-    assert(reports.modeChanged && reports.heartbeat && reports.sensor && policy.mode == ReportingMode::Normal);
-    assert(!policy.poll(320001, false, 0).modeChanged);
-    policy.set(ReportingMode::Quiet, 2, UINT32_MAX-1000);
-    assert(policy.remaining(998) == 1);
-    assert(policy.poll(999, false, 0).modeChanged);
-    policy.set(ReportingMode::Continuous, 0, 1000);
-    assert(!policy.poll(1999, false, 0).heartbeat);
-    assert(policy.poll(2000, false, 0).heartbeat);
-
     ReportingCommand command{};
     assert(parseReportingCommand("{\"t\":\"rm\",\"n\":1,\"q\":42,\"mode\":\"quiet\",\"duration_s\":30}", &command));
     ReportingRequests requests;

@@ -413,6 +413,7 @@ class AntennaControllerApp(App[None]):
             delta = gateway_ms-gateway["received_utc_ms"]
             age = time.monotonic()-gateway["received_monotonic"]
             lines.append(f"CYD {utc_text(gateway_ms)}  ΔPC {delta:+.0f} ms (age {age:.1f}s)")
+            lines.append(escape(f"  Clock {gateway.get('sync_state', 'unknown')} | rate {gateway.get('sync_rate_ppm', '—')} ppm | filtered error {gateway.get('sync_error_ms', '—')} ms"))
         else:
             lines.append("CYD UTC: awaiting synchronized gateway report")
         for state in states:
@@ -434,7 +435,8 @@ class AntennaControllerApp(App[None]):
                 f"  Az {heading} → {target} | {'+'.join(routes) or 'NONE'} | RSSI {ms(state.rssi_at_gateway_dbm)} dBm",
                 f"  UTC {utc_text(state.node_utc_ms)} (sample age {age_text})",
                 f"  ΔCYD {ms(state.node_cyd_offset_ms)} ms  σ {ms(state.cyd_jitter_ms)} ms | ΔPC {ms(state.node_pc_offset_ms)} ms",
-                f"  Sync age {('—' if state.sync_age_ms is None else f'{state.sync_age_ms/1000:.1f}s')} | last correction {ms(state.sync_step_ms)} ms",
+                f"  Sync age {('—' if state.sync_age_ms is None else f'{state.sync_age_ms/1000:.1f}s')} | last step {ms(state.sync_step_ms)} ms",
+                escape(f"  Clock {state.sync_state} | rate {ms(state.sync_rate_ppm)} ppm | filtered error {ms(state.sync_error_ms)} ms"),
             ])
         if self.controller.reporting.results:
             lines.append(escape(self.controller.reporting.describe()))

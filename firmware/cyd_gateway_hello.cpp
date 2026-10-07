@@ -576,6 +576,10 @@ void emitGatewayStatus() {
     doc["t"] = "gs"; doc["ts_ms"] = utcMilliseconds(); doc["tv"] = timeValid;
     doc["up_ms"] = millis(); doc["sync_age_ms"] = utcClock.syncAge(uint64_t(esp_timer_get_time())/1000);
     doc["sync_step_ms"] = utcClock.correctionMs; doc["pv"] = ProtocolVersion;
+    const uint64_t now = uint64_t(esp_timer_get_time())/1000;
+    doc["sync_error_ms"] = int32_t(lround(utcClock.filteredErrorMs));
+    doc["sync_rate_ppm"] = int16_t(lround(utcClock.ratePpm(now)));
+    doc["sync_state"] = clockStateName(utcClock.state(now));
     emitJsonFrame(doc);
 }
 

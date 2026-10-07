@@ -1,6 +1,6 @@
 # Node reporting, timing, and displays
 
-Current implementation: 2026-10-07, ESP-NOW protocol **4**. This specification
+Current implementation: 2026-10-07, ESP-NOW protocol **5**. This specification
 supersedes earlier fixed-rate node reporting and integer-second clock behavior.
 Nodes 1 (SURV) and 2 (REF) implement the same sensor/calibration/runtime features.
 Rotator movement is still simulated; no physical relay is actuated.
@@ -52,12 +52,16 @@ Completing calibration leaves continuous enabled until the operator changes it.
 
 ## Clock ownership and diagnostics
 
+The current clock discipline and UTC-aligned reporting slots are specified in
+[Timekeeping](timekeeping.md). Periodic transmissions now use node-specific
+UTC phases; ACKs and event reports stay immediate.
+
 The PC supplies UTC epoch milliseconds to the CYD over USB every three seconds.
 CYD and each node maintain a free-running clock anchored to a 64-bit monotonic
 timer. The CYD sends time to each node every 3/10/60 seconds in continuous/
 normal/quiet mode, plus the first valid synchronization. If CYD USB is down,
 the PC can seed node 2 through its serial relay. There is no battery-backed RTC;
-UTC is invalid after reboot until synchronized. A correction steps the clock;
+UTC is invalid after reboot until synchronized. Startup and confirmed large corrections step the clock; ordinary updates slew.
 quiet expiry uses monotonic time and is unaffected by UTC corrections.
 
 Legacy `ts` is UTC epoch seconds, not seconds since midnight. `ts_ms` adds
@@ -97,16 +101,16 @@ not a claim of continuous measurement delivery.
 
 ## Wire contract
 
-All three boards must run protocol 4 together; protocol 3 is incompatible.
+All three boards must run protocol 5 together; older versions are incompatible.
 Packed little-endian ESP32 layouts are defined in `espnow_smoke_config.h`,
 `runtime_protocol.h`, and `calibration_protocol.h`. There is no JSON on air.
 
 | Packet | Bytes | Type |
 |---|---:|---|
-| Status / rotator command / ACK / time sync | 55 | 1 / 2 / 3 / 4 |
+| Status / rotator command / ACK / time sync | 62 | 1 / 2 / 3 / 4 |
 | Raw sensors | 26 | 5 |
 | Calibration command / report | 56 / 52 | 6 / 7 |
-| Reporting command / ACK | 12 / 55 | 8 / 9 |
+| Reporting command / ACK | 12 / 62 | 8 / 9 |
 
 Reporting command layout is `type:u8,node:u8,version:u8,mode:u8,request:u32,
 durationSeconds:u32`; modes are continuous=0, normal=1, quiet=2. Request ID is
@@ -114,10 +118,11 @@ nonzero. Non-quiet durations must be zero. The last eight request IDs/payloads
 are retained in RAM: identical replay acknowledges current state without
 extending quiet; conflicting payload is rejected. Reboot clears that cache.
 
-The 55-byte Packet retains the original 20-byte prefix and appends
+The 62-byte Packet retains the original 20-byte prefix and appends
 `utcMilliseconds:u64, uptimeMs:u32, reportingMode:u8, quietRemainingMs:u32,
 clockSyncAgeMs:u32, clockCorrectionMs:i32, reportingRequest:u32,
-reportingError:u8, boot:u32, calibrationFlags:u8`.
+reportingError:u8, boot:u32, calibrationFlags:u8, clockErrorMs:i32,
+clockRatePpm:i16, clockState:u8`.
 
 USB and the optional TCP relay use compact JSON lines:
 
@@ -128,6 +133,7 @@ USB and the optional TCP relay use compact JSON lines:
 
 `rm` is sent separately to each node with the same global request ID. `rp`
 adds `ts_ms,tv,mode,quiet_left_ms,up_ms,sync_age_ms,sync_step_ms,mr,me,boot,cf`;
+`sync_error_ms,sync_rate_ppm,sync_state` expose clock discipline;
 `mr` correlates a mode acknowledgment, `me` is 0 accepted or 2 rejected.
 CYD adds `gw_rx_ms` when synchronized, plus radio RSSI `rg/rn`.
 `gs` is CYD's one-second USB clock/status message with
@@ -158,7 +164,7 @@ both nodes in normal mode; does not change calibration or command movement):
 
 This records raw JSON in ignored `runtime-smoke.log`. Enumerate ports first.
 
-On hardware, verify both node IDs, protocol 4, advancing UTC, one-second USB
+On hardware, verify both node IDs, protocol 5, advancing UTC, one-second USB
 telemetry in every mode, normal ten-second RF reports, a static quiet window
 over 60 seconds, timer expiry, and the physical display. Repeat with hand
 rotation beyond 10° using valid sensors. Test commanded-motion cadence with

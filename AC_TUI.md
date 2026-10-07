@@ -2,6 +2,10 @@
 
 ## Overview
 
+Clock diagnostics now include disciplined-clock state, signed rate correction
+in ppm, filtered phase error, and last actual time step. See
+[timekeeping](docs/timekeeping.md) for slew limits and staggered report slots.
+
 Plots use `x` sample markers with no connecting lines by default in every
 graph mode. Press **L** or click **L Lines: off/on** beside the graph controls
 to toggle connecting lines drawn with `.` characters. Sample markers remain

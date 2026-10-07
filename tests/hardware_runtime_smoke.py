@@ -1,4 +1,4 @@
-"""Check protocol-4 UTC and reporting cadence on an idle, stationary bench.
+"""Check protocol-5 disciplined UTC and staggered cadence on a stationary bench.
 
 Temporarily sets both nodes continuous, normal, then quiet for 66 seconds;
 leaves both normal. No reset, rotator, calibration apply/save/clear commands.
@@ -86,6 +86,18 @@ def cadence(records, route, node, kind, period, minimum):
     print(f'{route} N{node} {kind}: {len(samples)} reports, expected {period:g}s', flush=True)
 
 
+def phase_check(records, node, period_ms):
+    samples = messages(records, 'gateway', node, 'rp')
+    samples = [r['message'] for r in samples if not r['message'].get('mr')]
+    assert samples, f'N{node}: no periodic status to check'
+    offset = (node % 10)*100 if period_ms == 1000 else (node % (period_ms//1000))*1000
+    errors = [(m['ts_ms']-offset) % period_ms for m in samples]
+    assert max(errors) <= 120, f'N{node}: late/off-slot reports {errors}'
+    assert all(m.get('sync_state') in ('tracking','slewing') for m in samples)
+    assert all(abs(m['sync_rate_ppm']) <= 500 for m in samples)
+    print(f'N{node} {period_ms}ms slots: lateness {min(errors)}..{max(errors)} ms', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gateway-port', required=True)
@@ -105,11 +117,12 @@ def main():
         evidence = stack.enter_context(open(args.output, 'w', encoding='utf-8'))
         bench = Bench(ports, evidence)
         initial = bench.collect(2)
-        assert any(r['message'].get('t') == 'gs' and r['message'].get('pv') == 4 for r in initial), 'CYD protocol 4 required'
+        assert any(r['message'].get('t') == 'gs' and r['message'].get('pv') == 5 for r in initial), 'CYD protocol 5 required'
         try:
             bench.mode('continuous')
             continuous = bench.collect(7)
             for node in (1, 2):
+                phase_check(continuous, node, 1000)
                 for kind in ('rp', 'rs'):
                     cadence(continuous, 'gateway', node, kind, 1, 5)
                 sample = messages(continuous, 'gateway', node, 'rp')[-1]
@@ -120,14 +133,18 @@ def main():
             bench.mode('normal')
             normal = bench.collect(22)
             for node in (1, 2):
+                phase_check(normal, node, 10000)
                 for kind in ('rp', 'rs'):
                     cadence(normal, 'gateway', node, kind, 10, 2)
                     cadence(normal, f'node{node}', node, kind, 1, 19)
             bench.mode('quiet', 66)
-            quiet = bench.collect(62)  # t=2..64: includes 60s heartbeat, before expiry.
+            quiet = bench.collect(62)  # t=2..64: includes at least one UTC minute slot.
             for node in (1, 2):
                 statuses = messages(quiet, 'gateway', node, 'rp')
-                assert len(statuses) == 1 and statuses[0]['message']['mode'] == 'quiet', f'N{node}: expected one quiet heartbeat'
+                assert 1 <= len(statuses) <= 2 and all(r['message']['mode'] == 'quiet' for r in statuses), f'N{node}: expected minute slots'
+                phase_check(quiet, node, 60000)
+                if len(statuses) == 2:
+                    cadence(quiet, 'gateway', node, 'rp', 60, 2)
                 for kind in ('rs', 'cs'):
                     assert not messages(quiet, 'gateway', node, kind), f'N{node}: unexpected {kind}; keep sensors stationary'
                 for kind in ('rp', 'rs'):
@@ -135,7 +152,13 @@ def main():
             expired = bench.collect(5)
             for node in (1, 2):
                 assert any(r['message'].get('mode') == 'normal' for r in messages(expired, 'gateway', node, 'rp')), f'N{node}: quiet did not expire'
-            print('PASS: both-node UTC, RF cadence, quiet suppression/expiry and continuous USB', flush=True)
+            for node in (1, 2):
+                samples = [r['message'] for r in messages(bench.records, f'node{node}', node, 'rp') if r['message'].get('tv')]
+                for previous, current in zip(samples, samples[1:]):
+                    elapsed = (current['up_ms']-previous['up_ms']) & 0xffffffff
+                    delta = current['ts_ms']-previous['ts_ms']
+                    assert abs(delta-elapsed) <= 3+elapsed*.0005, f'N{node}: unexpected clock step'
+            print('PASS: staggered slots, bounded continuous clocks, quiet expiry and continuous USB', flush=True)
         finally:
             bench.mode('normal')
 

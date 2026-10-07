@@ -62,7 +62,7 @@ float pitchDeg = 0.0F;
 #endif
 
 struct ReceivedPacket {
-    uint8_t payload[sizeof(CalibrationCommand)];
+    uint8_t payload[64];
     uint8_t length;
 };
 
@@ -82,7 +82,7 @@ bool serialReported = false;
 uint32_t sequenceNumber = 0;
 bool timeValid = false;
 UtcClock utcClock;
-ReportingPolicy reporting;
+ReportingPolicy reporting(NodeId);
 OrientationReference quietOrientation;
 ReportingRequests reportingRequests;
 uint8_t lastCalibrationFlags = 0;
@@ -284,6 +284,9 @@ void sendPacket(PacketType packetType, CommandType command = CommandType::None,
     packet.utcMilliseconds = utcClock.at(now); packet.uptimeMs = millis();
     packet.reportingMode = uint8_t(reporting.mode); packet.quietRemainingMs = reporting.remaining(millis());
     packet.clockSyncAgeMs = utcClock.syncAge(now); packet.clockCorrectionMs = utcClock.correctionMs;
+    packet.clockErrorMs = int32_t(lround(utcClock.filteredErrorMs));
+    packet.clockRatePpm = int16_t(lround(utcClock.ratePpm(now)));
+    packet.clockState = utcClock.state(now);
     packet.reportingRequest = reportingRequest; packet.reportingError = reportingError;
     packet.boot = calibrationBoot; packet.calibrationFlags = lastCalibrationFlags;
     if (radio) esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
@@ -862,7 +865,9 @@ void loop() {
         unexpectedTurn = quietOrientation.change(correctedAccel, correctedMag,
                                                 moving || reporting.mode != ReportingMode::Quiet);
 #endif
-    const RadioReports radio = reporting.poll(nowMs, moving, unexpectedTurn);
+    const uint64_t clockNow = uint64_t(esp_timer_get_time())/1000;
+    const RadioReports radio = reporting.poll(clockNow, moving, unexpectedTurn,
+                                              utcClock.at(clockNow), utcClock.generation);
     const bool serialTick = !serialReported || nowMs-lastSerialReportMs >= StatusPeriodMs;
     if (serialTick) { lastSerialReportMs = nowMs; serialReported = true; }
     if (serialTick || radio.sensor) sendCalibrationReport(0, 0, radio.sensor, serialTick);

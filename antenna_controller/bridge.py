@@ -130,6 +130,9 @@ class NodeState:
     node_utc_ms: int | None = None
     sync_age_ms: int | None = None
     sync_step_ms: int | None = None
+    sync_error_ms: int | None = None
+    sync_rate_ppm: int | None = None
+    sync_state: str = "unknown"
     node_cyd_offset_ms: float | None = None
     node_pc_offset_ms: float | None = None
     cyd_jitter_ms: float | None = None
@@ -253,6 +256,9 @@ class NodeStateStore:
                 age = message.get("sync_age_ms")
                 state.sync_age_ms = age if isinstance(age, int) and 0 <= age < 0xffffffff else None
                 state.sync_step_ms = message.get("sync_step_ms")
+                state.sync_error_ms = message.get("sync_error_ms")
+                state.sync_rate_ppm = message.get("sync_rate_ppm")
+                state.sync_state = str(message.get("sync_state", "unknown"))
                 if state.node_utc_ms:
                     state.node_pc_offset_ms = state.node_utc_ms-now_ms
                     samples = self.clock_samples.setdefault((node_id, route + "-pc"), deque(maxlen=60))

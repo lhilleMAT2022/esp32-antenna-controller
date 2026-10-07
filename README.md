@@ -10,8 +10,20 @@ connected over ESP-NOW, node firmware, and a host-side control adapter.
 
 ## Current development snapshot — 2026-10-07
 
+The deployed timing increment uses filtered, bounded clock slewing and staggers
+periodic radio reports by node ID against UTC (uptime before synchronization).
+See [timekeeping and report slots](docs/timekeeping.md). It requires protocol
+**5** on CYD and both nodes. All three are flashed; 45 software tests and the
+hardware slot/clock/quiet checks pass. Both nodes are left in normal mode.
+See the [timing deployment results](docs/verification/2026-10-07-timing.md).
+The protocol-4 results below are the prior bench checkpoint.
+
 TUI plots default to unconnected `x` markers. Press **L** or click
 **L Lines: off/on** to toggle dotted (`.`) connecting lines in any graph mode.
+
+Current firmware occupies 61–63% of each board's 1.25 MiB application slot.
+See the [memory budget](docs/memory-budget.md) for exact sizes and the
+distinction between flash capacity, static RAM and runtime heap usage.
 
 Both nodes now appear in the TUI calibration panel with A/B XYZ and
 magnitude/azimuth°/elevation° (MAE). Health shows actual reporting mode,

@@ -14,7 +14,7 @@ constexpr uint8_t Channel = 1;
 constexpr uint32_t TimeSyncPeriodMs = 3000;
 constexpr uint32_t StatusPeriodMs = 1000;
 constexpr uint8_t AntennaNodeCount = 2;
-constexpr uint8_t ProtocolVersion = 4;
+constexpr uint8_t ProtocolVersion = 5;
 constexpr int8_t RssiUnavailable = 127;
 constexpr int16_t NoAzimuthDeciDegrees = -1;
 
@@ -79,9 +79,12 @@ struct __attribute__((packed)) Packet {
     uint8_t reportingError;
     uint32_t boot;
     uint8_t calibrationFlags;
+    int32_t clockErrorMs;
+    int16_t clockRatePpm;
+    uint8_t clockState;
 };
 
-static_assert(sizeof(Packet) == 55, "Antenna-controller packet size changed");
+static_assert(sizeof(Packet) == 62, "Antenna-controller packet size changed");
 
 struct __attribute__((packed)) SensorTelemetry {
     uint8_t packetType;

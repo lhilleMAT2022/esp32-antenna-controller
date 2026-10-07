@@ -13,6 +13,9 @@ class GatewayFreshnessTests(unittest.TestCase):
     def test_reporting_clock_vectors_and_runtime_protocol(self):
         self.compile_and_run('runtime_test.cpp')
 
+    def test_clock_discipline_and_staggered_slots(self):
+        self.compile_and_run('timing_test.cpp')
+
     def compile_and_run(self, filename):
         compiler = shutil.which('g++')
         if not compiler and Path('C:/msys64/mingw64/bin/g++.exe').is_file():

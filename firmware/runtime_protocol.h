@@ -67,6 +67,8 @@ inline void emitRuntimeStatus(const Packet& packet, const char* source,
     doc["mode"] = reportingName(ReportingMode(packet.reportingMode));
     doc["quiet_left_ms"] = packet.quietRemainingMs; doc["up_ms"] = packet.uptimeMs;
     doc["sync_age_ms"] = packet.clockSyncAgeMs; doc["sync_step_ms"] = packet.clockCorrectionMs;
+    doc["sync_error_ms"] = packet.clockErrorMs; doc["sync_rate_ppm"] = packet.clockRatePpm;
+    doc["sync_state"] = clockStateName(packet.clockState);
     doc["mr"] = packet.reportingRequest; doc["me"] = packet.reportingError;
     doc["boot"] = packet.boot; doc["cf"] = packet.calibrationFlags;
     doc["rn"] = packet.receiverRssiDbm;

@@ -46,9 +46,9 @@ protection.
 
 ## Packet contract
 
-Protocol version 4 uses a packed 55-byte rotator `Packet`, 26-byte raw
+Protocol version 5 uses a packed 62-byte rotator `Packet`, 26-byte raw
 `SensorTelemetry`, 56-byte calibration command and 52-byte calibration report.
-Reporting commands are 12 bytes; their ACK uses the 55-byte Packet.
+Reporting commands are 12 bytes; their ACK uses the 62-byte Packet.
 All three boards must be upgraded together. See [runtime contract](../../../node-runtime.md)
 for appended fields, clock semantics, reporting states and acknowledgments.
 
@@ -122,6 +122,10 @@ Because each real button press reverses the available direction for the next
 press, a desired direction that differs from `nextPressDirection` performs a
 100 ms virtual toggle press followed by coast-down, then starts the intended
 press. This tiny modeled motion is intentional.
+
+See [timekeeping](../../../timekeeping.md) for clock discipline and staggered
+UTC/uptime slots. Packet sizes and clock policy supersede the protocol-4
+checkpoint.
 
 ## Rates and initialization
 

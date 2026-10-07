@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <limits.h>
+#include "clock_discipline.h"
 
 namespace antenna_controller {
 enum class ReportingMode : uint8_t { Continuous = 0, Normal = 1, Quiet = 2 };
@@ -22,26 +23,6 @@ inline uint32_t linkTimeout(ReportingMode mode) {
     return mode == ReportingMode::Continuous ? 5000 :
            mode == ReportingMode::Quiet ? 90000 : 25000;
 }
-
-struct UtcClock {
-    bool valid = false;
-    uint64_t epochMs = 0, anchorMs = 0;
-    int32_t correctionMs = 0;
-    uint64_t at(uint64_t monotonicMs) const {
-        return valid ? uint64_t(int64_t(epochMs) + int64_t(monotonicMs) - int64_t(anchorMs)) : 0;
-    }
-    void synchronize(uint64_t utcMs, uint64_t monotonicMs) {
-        if (!utcMs) return;
-        const int64_t correction = valid ? int64_t(utcMs) - int64_t(at(monotonicMs)) : 0;
-        correctionMs = correction > INT32_MAX ? INT32_MAX :
-                       correction < INT32_MIN ? INT32_MIN : int32_t(correction);
-        epochMs = utcMs; anchorMs = monotonicMs; valid = true;
-    }
-    uint32_t syncAge(uint64_t monotonicMs) const {
-        const uint64_t age = monotonicMs - anchorMs;
-        return !valid || age > UINT32_MAX ? UINT32_MAX : uint32_t(age);
-    }
-};
 
 struct VectorMae { float magnitude, azimuth, elevation; };
 inline VectorMae vectorMae(float x, float y, float z) {
@@ -84,12 +65,42 @@ struct OrientationReference {
     }
 };
 
+// Absolute slot scheduling: no replay of missed slots, no mode-relative phase.
+struct PeriodicSlot {
+    uint64_t nextMs = 0, previousTime = 0, lastSentMono = 0;
+    uint32_t periodMs = 0, generation = 0;
+    bool initialized = false, sent = false;
+    static uint32_t phase(uint8_t node, uint32_t period) {
+        return period == 1000 ? (node%10)*100 : (node%(period/1000))*1000;
+    }
+    static uint64_t next(uint64_t time, uint32_t period, uint32_t offset) {
+        const uint64_t candidate = time-time%period+offset;
+        return candidate > time ? candidate : candidate+period;
+    }
+    bool poll(uint64_t mono, uint64_t time, uint32_t clockGeneration,
+              uint32_t period, uint8_t node) {
+        const uint32_t offset = phase(node, period);
+        // A step or uptime-to-UTC transition establishes a new future slot.
+        const bool reset = !initialized || periodMs != period || generation != clockGeneration || time < previousTime;
+        const bool due = !reset && time >= nextMs;
+        const bool onTime = due && time-nextMs <= 100;
+        const bool spaced = !sent || mono-lastSentMono >= (period == 1000 ? 500 : 1000);
+        if (reset || due) nextMs = next(time, period, offset);
+        periodMs = period; generation = clockGeneration; initialized = true;
+        previousTime = time;
+        if (onTime && spaced) { lastSentMono = mono; sent = true; return true; }
+        return false;
+    }
+};
+
 struct RadioReports { bool heartbeat = false, sensor = false, modeChanged = false; };
 struct ReportingPolicy {
     ReportingMode mode = ReportingMode::Normal;
-    uint32_t quietStartedMs = 0, quietDurationMs = 0;
-    uint32_t lastHeartbeatMs = 0, lastSensorMs = 0;
-    bool heartbeatSent = false, sensorSent = false, wasMoving = false;
+    uint8_t nodeId = 1;
+    uint32_t quietStartedMs = 0, quietDurationMs = 0, lastSensorMs = 0;
+    bool wasMoving = false;
+    PeriodicSlot heartbeatSlot, sensorSlot;
+    explicit ReportingPolicy(uint8_t node = 1) : nodeId(node) {}
     uint32_t remaining(uint32_t now) const {
         const uint32_t elapsed = now-quietStartedMs;
         return mode == ReportingMode::Quiet && elapsed < quietDurationMs ? quietDurationMs-elapsed : 0;
@@ -97,11 +108,15 @@ struct ReportingPolicy {
     bool set(ReportingMode next, uint32_t seconds, uint32_t now) {
         if (uint8_t(next) > 2 || (next == ReportingMode::Quiet ? (!seconds || seconds > MaxQuietSeconds) : seconds != 0)) return false;
         mode = next; quietStartedMs = now; quietDurationMs = seconds*1000;
-        // The command acknowledgment is the initial heartbeat for this mode.
-        lastHeartbeatMs = lastSensorMs = now; heartbeatSent = sensorSent = true;
+        lastSensorMs = now;
+        heartbeatSlot.initialized = sensorSlot.initialized = false;
         return true;
     }
-    RadioReports poll(uint32_t now, bool moving, float uncommandedTurn) {
+    RadioReports poll(uint64_t mono, bool moving, float uncommandedTurn,
+                      uint64_t utc = 0, uint32_t clockGeneration = 0) {
+        const uint32_t now = uint32_t(mono);
+        const uint64_t time = utc ? utc : mono;
+        const uint32_t generation = utc ? clockGeneration : 0;
         RadioReports result;
         if (mode == ReportingMode::Quiet && remaining(now) == 0) {
             mode = ReportingMode::Normal; quietDurationMs = 0;
@@ -109,15 +124,17 @@ struct ReportingPolicy {
         }
         const bool completed = wasMoving && !moving;
         wasMoving = moving;
-        result.heartbeat |= completed || !heartbeatSent || now-lastHeartbeatMs >= heartbeatPeriod(mode, moving);
+        const bool heartbeatDue = heartbeatSlot.poll(mono, time, generation, heartbeatPeriod(mode, moving), nodeId);
+        result.heartbeat |= completed || heartbeatDue;
         if (mode != ReportingMode::Quiet || moving) {
-            const uint32_t sensorPeriod = mode == ReportingMode::Normal && moving ? 1000 : heartbeatPeriod(mode, moving);
-            result.sensor |= completed || !sensorSent || now-lastSensorMs >= sensorPeriod;
+            const uint32_t period = mode == ReportingMode::Normal && moving ? 1000 : heartbeatPeriod(mode, moving);
+            const bool sensorDue = sensorSlot.poll(mono, time, generation, period, nodeId);
+            result.sensor |= completed || sensorDue;
         } else {
+            sensorSlot.initialized = false;
             result.sensor |= completed || (isfinite(uncommandedTurn) && uncommandedTurn > QuietTurnDegrees && now-lastSensorMs >= 1000);
         }
-        if (result.heartbeat) { lastHeartbeatMs = now; heartbeatSent = true; }
-        if (result.sensor) { lastSensorMs = now; sensorSent = true; }
+        if (result.sensor) lastSensorMs = now;
         return result;
     }
 };
