@@ -48,32 +48,36 @@ class CalibrationHelp(ModalScreen):
         padding: 1 2; background: #06334b; border: thick #168aad; overflow-y: auto; }
     """
 
+    def __init__(self, node_id: int = 2) -> None:
+        super().__init__()
+        self.node_id = node_id
+
     def compose(self) -> ComposeResult:
         with Vertical(id="cal-help"):
             yield Static(
-                "[bold]NODE 2 SENSOR CALIBRATION[/]\n\n"
+                f"[bold]NODE {self.node_id} SENSOR CALIBRATION[/]\n\n"
                 "Stop antenna motion. Use the final sensor/electronics arrangement.\n"
                 "These captures require moving the sensor by hand.\n\n"
                 "[bold]1. Magnetometer[/]\n"
-                "Enter [cyan]cal 2 start mag[/], then slowly tumble ALL three axes.\n"
+                f"Enter [cyan]cal {self.node_id} start mag[/], then slowly tumble ALL three axes.\n"
                 "Collect at least 120 samples (about two minutes). A level circle is insufficient.\n"
-                "Enter [cyan]cal 2 fit mag[/]. If it passes, enter [cyan]cal 2 apply mag[/].\n\n"
+                f"Enter [cyan]cal {self.node_id} fit mag[/]. If it passes, enter [cyan]cal {self.node_id} apply mag[/].\n\n"
                 "[bold]2. Accelerometer[/]\n"
-                "Point sensor +X UP, hold still, then enter [cyan]cal 2 face +x[/].\n"
+                f"Point sensor +X UP, hold still, then enter [cyan]cal {self.node_id} face +x[/].\n"
                 "Wait for 12 samples. Repeat with -x, +y, -y, +z, -z pointing UP.\n"
-                "Enter [cyan]cal 2 fit accel[/], then [cyan]cal 2 apply accel[/].\n\n"
+                f"Enter [cyan]cal {self.node_id} fit accel[/], then [cyan]cal {self.node_id} apply accel[/].\n\n"
                 "Raw captures and fit results are saved under calibration_captures/.\n"
                 "Failures show affected faces and measured errors. Repeat those faces and refit.\n"
-                "[cyan]cal 2 export[/] saves another snapshot, even with the node offline.\n\n"
+                f"[cyan]cal {self.node_id} export[/] saves another snapshot, even with the node offline.\n\n"
                 "[bold]3. Mounting and true north[/]\n"
-                "Enter [cyan]cal 2 align <forward-axis> <up-axis> <declination>[/].\n"
-                "Example: [cyan]cal 2 align +x +z -12[/] ONLY if +X points along the Yagi,\n"
+                f"Enter [cyan]cal {self.node_id} align <forward-axis> <up-axis> <declination>[/].\n"
+                f"Example: [cyan]cal {self.node_id} align +x +z -12[/] ONLY if +X points along the Yagi,\n"
                 "+Z points up and local declination is 12 degrees west. Use your actual values.\n"
                 "Axes must align with the mount. Check corrected heading at surveyed bearings.\n\n"
                 "[bold]4. Save[/]\n"
-                "Enter [cyan]cal 2 save[/]. Wait for NODE confirmation and SAVED.\n"
-                "Power-cycle later and verify [cyan]cal 2 status[/].\n"
-                "[cyan]cal 2 clear[/] erases saved corrections; [cyan]cal 2 cancel[/] ends capture.\n\n"
+                f"Enter [cyan]cal {self.node_id} save[/]. Wait for NODE confirmation and SAVED.\n"
+                f"Power-cycle later and verify [cyan]cal {self.node_id} status[/].\n"
+                f"[cyan]cal {self.node_id} clear[/] erases saved corrections; [cyan]cal {self.node_id} cancel[/] ends capture.\n\n"
                 "Corrected heading is diagnostic; rotator position remains simulated."
             )
             yield Button("Close — enter commands in the manual field", id="cal-help-close")
@@ -224,6 +228,7 @@ class AntennaControllerApp(App[None]):
         self.mode = "track"
         self.window_s = 60
         self.node_filter = "all"
+        self.calibration_node = 2
         self.log_filter = "all"
         self._last_state_stamp: tuple[int, int] = (0, 0)
         self._last_event_sequence = 0
@@ -405,17 +410,18 @@ class AntennaControllerApp(App[None]):
         self.query_one("#heartbeats", Static).update("\n".join(lines))
 
     def _update_calibration(self, states: list["NodeState"]) -> None:
-        sensor = states[1]
+        node_id = self.calibration_node
+        sensor = states[node_id - 1]
         magnetic = self._vector_text(sensor.magnetic_ut, 1, "µT")
         acceleration = self._vector_text(sensor.acceleration_g, 3, "g")
-        status = escape(self.controller.calibration.describe(2))
+        status = escape(self.controller.calibration.describe(node_id))
         self.query_one("#calibration", Static).update(
-            "[bold cyan]N2 SENSOR / CALIBRATION[/]  "
+            f"[bold cyan]N{node_id} SENSOR / CALIBRATION[/]  "
             + status
             + "\n"
             + f"Bxyz {magnetic}\n"
             + f"Axyz {acceleration}\n"
-            + "[dim]c: instructions | cal 2 status: query node[/]"
+            + f"[dim]Select Node 1/2 above | c: instructions | cal {node_id} status[/]"
         )
 
     def _update_events(self) -> None:
@@ -567,6 +573,8 @@ class AntennaControllerApp(App[None]):
     def node_changed(self, event: Select.Changed) -> None:
         if isinstance(event.value, str):
             self.node_filter = event.value
+            if event.value in ("node 1", "node 2"):
+                self.calibration_node = int(event.value[-1])
             self._update_plot()
 
     @on(Select.Changed, "#log-select")
@@ -606,6 +614,8 @@ class AntennaControllerApp(App[None]):
         if not fields:
             raise ValueError("empty command")
         if fields[0] == "cal":
+            if len(fields) >= 2 and fields[1] in ("1", "2"):
+                self.calibration_node = int(fields[1])
             self.query_one("#health-tabs", TabbedContent).active = "calibration-tab"
             return self.controller.calibration.command(fields[1:])
         if fields[0] == "goto" and len(fields) == 3:
@@ -673,7 +683,7 @@ class AntennaControllerApp(App[None]):
     @on(Button.Pressed, "#cal-help-button")
     def action_calibration_help(self) -> None:
         self.query_one("#health-tabs", TabbedContent).active = "calibration-tab"
-        self.push_screen(CalibrationHelp())
+        self.push_screen(CalibrationHelp(self.calibration_node))
 
     def action_step_node(self, node_id: int, delta_deg: float) -> None:
         try:

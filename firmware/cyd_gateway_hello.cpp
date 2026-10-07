@@ -11,6 +11,7 @@
 #include "espnow_smoke_config.h"
 #include "serial_json_protocol.h"
 #include "calibration_protocol.h"
+#include "receive_freshness.h"
 
 namespace {
 using namespace antenna_controller;
@@ -51,7 +52,7 @@ struct NodeStatus {
     uint8_t flags = 0;
     int8_t rssiAtGateway = RssiUnavailable;
     int8_t rssiAtNode = RssiUnavailable;
-    uint32_t lastHeardMs = 0;
+    ReceiveFreshness link;
     uint32_t nodeEpochSeconds = 0;
     uint8_t sensorFlags = 0;
     int16_t magneticHeadingDeciDegrees = NoAzimuthDeciDegrees;
@@ -63,7 +64,7 @@ struct NodeStatus {
     int16_t accelerationZMilliG = 0;
     int16_t rollDeciDegrees = 0;
     int16_t pitchDeciDegrees = 0;
-    uint32_t lastSensorMs = 0;
+    ReceiveFreshness sensor;
 };
 
 ReceivedPacket receiveQueue[ReceiveQueueSize]{};
@@ -128,13 +129,12 @@ bool macMatches(const uint8_t* first, const uint8_t* second) {
 
 bool nodeOnline(uint8_t nodeId) {
     const int index = nodeIndex(nodeId);
-    return index >= 0 && millis() - nodeStatus[index].lastHeardMs < NodeOfflineMs;
+    return index >= 0 && nodeStatus[index].link.fresh(millis(), NodeOfflineMs);
 }
 
 bool sensorTelemetryFresh(uint8_t nodeId) {
     const int index = nodeIndex(nodeId);
-    return index >= 0 && nodeStatus[index].lastSensorMs != 0 &&
-           millis() - nodeStatus[index].lastSensorMs < SensorOfflineMs;
+    return index >= 0 && nodeStatus[index].sensor.fresh(millis(), SensorOfflineMs);
 }
 
 uint32_t epochNow() {
@@ -253,7 +253,7 @@ void drawHeader(const char* title) {
 void drawNodeCard(uint8_t nodeId, int y) {
     const NodeStatus& status = nodeStatus[nodeIndex(nodeId)];
     const bool online = nodeOnline(nodeId);
-    const bool moving = hasFlag(status.flags, StatusFlag::Moving);
+    const bool moving = online && hasFlag(status.flags, StatusFlag::Moving);
     const int cardHeight = 98;
     const int buttonY = y + 72;
     char azimuth[12];
@@ -449,6 +449,24 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
     }
 }
 
+void refreshNodeFreshness(uint32_t nowMs) {
+    for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
+        const int index = nodeIndex(nodeId);
+        NodeStatus& status = nodeStatus[index];
+        const bool linkChanged = status.link.update(nowMs, NodeOfflineMs);
+        const bool sensorChanged = status.sensor.update(nowMs, SensorOfflineMs);
+        if (linkChanged || sensorChanged) {
+            nodeCardDirty[index] = true;
+            debugDirty = true;
+        }
+        if (linkChanged) {
+            const char* state = status.link.wasFresh ? "ONLINE" : "OFFLINE";
+            appendEvent("N%u %s", nodeId, state);
+            Serial.printf("LINK N%u %s\n", nodeId, state);
+        }
+    }
+}
+
 void onDataReceived(const uint8_t* sourceMac,
                     const uint8_t* data,
                     int dataLength) {
@@ -596,6 +614,7 @@ void processReceivedPackets() {
             if (report.type == 7 && report.version == ProtocolVersion &&
                 nodeIndex(report.node) >= 0 &&
                 macMatches(received.sourceMac, antennaNodeMac(report.node))) {
+                nodeStatus[nodeIndex(report.node)].link.receive(millis());
                 emitCalibrationJson(report, "espnow");
             }
             continue;
@@ -628,7 +647,8 @@ void processReceivedPackets() {
             sensorStatus.accelerationZMilliG = telemetry.accelerationZMilliG;
             sensorStatus.rollDeciDegrees = telemetry.rollDeciDegrees;
             sensorStatus.pitchDeciDegrees = telemetry.pitchDeciDegrees;
-            sensorStatus.lastSensorMs = millis();
+            sensorStatus.sensor.receive(millis());
+            sensorStatus.link.receive(millis());
 
             const float x = telemetry.magneticXDeciMicrotesla / 10.0F;
             const float y = telemetry.magneticYDeciMicrotesla / 10.0F;
@@ -672,7 +692,7 @@ void processReceivedPackets() {
         status.targetDeciDegrees = packet.targetDeciDegrees;
         status.flags = packet.flags;
         status.nodeEpochSeconds = packet.epochSeconds;
-        status.lastHeardMs = millis();
+        status.link.receive(millis());
         const int8_t rssiAtGateway = latestRssiForNode(packet.senderId);
         if (rssiAtGateway != RssiUnavailable) {
             status.rssiAtGateway = rssiAtGateway;
@@ -1217,6 +1237,7 @@ void loop() {
     processReceivedPackets();
 
     const uint32_t nowMs = millis();
+    refreshNodeFreshness(nowMs);
     if (nowMs >= nextTimeSyncMs) {
         sendTimeSync();
         nextTimeSyncMs = nowMs + TimeSyncPeriodMs;
@@ -1230,7 +1251,7 @@ void loop() {
     if (motionBlinkPhase != lastMotionBlinkPhase) {
         lastMotionBlinkPhase = motionBlinkPhase;
         for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
-            if (hasFlag(nodeStatus[nodeIndex(nodeId)].flags,
+            if (nodeOnline(nodeId) && hasFlag(nodeStatus[nodeIndex(nodeId)].flags,
                         StatusFlag::Moving)) {
                 nodeCardDirty[nodeIndex(nodeId)] = true;
             }

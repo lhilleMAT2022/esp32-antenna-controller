@@ -52,8 +52,8 @@ route is unavailable. Physical relay control is a later increment.
 The calibration software now provides guided host capture, 3-D magnetometer
 fitting, six-face accelerometer fitting, mounting-axis/declination setup, and
 node-confirmed apply/save/clear operations through CYD or the optional relay.
-Node 2 stores a validated, versioned calibration record in ESP32 NVS and
-reloads it at boot. Raw vectors remain available and rotator feedback remains
+Each sensor-equipped node stores a validated, versioned calibration record in
+ESP32 NVS and reloads it at boot. Raw vectors remain available and rotator feedback remains
 simulated. Physical capture and power-cycle acceptance are still pending.
 
 Verification on 2026-10-06: 25 host/native tests pass, all three firmware
@@ -83,6 +83,31 @@ tilt that passes preliminary gates, failed-fit archival, face replacement,
 and disk-write failure recovery. Calibration save/power-cycle acceptance
 remains pending. See the
 [capture diagnostics](docs/calibration.md#capture-files-and-failed-fit-diagnostics).
+
+## Node 1 sensor and CYD status update — 2026-10-07
+
+Node 1 was identified by MAC `5c:01:3b:34:44:d8` on COM11 and flashed with
+LSM303AGR sampling and calibration support. Both its magnetometer and
+accelerometer report valid data (`sf=15`, `cf=96`). Calibration status and
+invalid-matrix rejection passed over direct USB and through CYD/ESP-NOW.
+The host calibration panel and help now follow the selected node or the node
+specified in a calibration command; use `cal 1 ...` for this new sensor.
+
+CYD COM10, MAC `04:b2:47:82:97:18`, was flashed with the link-status fix.
+Previously, a zero-initialized receive timestamp falsely indicated ONLINE
+at boot, and silent-node expiry did not request a screen redraw. The display
+now starts OFFLINE and redraws on packet receipt, timeout, and recovery.
+
+All 35 host/native/TUI tests and all three firmware builds passed. The live
+link test held Node 1 in reset: CYD reported OFFLINE 4.32 seconds later
+(five seconds after the last received packet), kept Node 2 ONLINE, and
+restored Node 1 ONLINE with valid sensor data after reset was released.
+This verified the serial link transitions and the firmware path that requests
+the card redraw. Visual confirmation on the physical display remains an
+operator check.
+Node 2 was not reflashed or reset during this update. It was communicating
+but reported no detected sensors (`sf=0`, `cf=0`); its sensor connection still
+needs checking. No calibration was applied, saved, or cleared by these tests.
 
 ## Scope
 
@@ -181,9 +206,10 @@ Before enabling either interface, record the actual node-board pinout and
 mounting arrangement, add a hardware-abstraction layer with outputs disabled
 by default, and complete a bench test before connecting to a rotator.
 
-### Node 2 LSM303AGR bring-up
+### Remote-node LSM303AGR sensors
 
-Node 2 is configured for the Adafruit LSM303AGR on its default I2C bus:
+Both remote-node firmware targets enable the Adafruit LSM303AGR on their
+default I2C bus:
 
 | Qwiic wire | Signal | ESP32 pin |
 |---|---|---|
@@ -194,14 +220,30 @@ Node 2 is configured for the Adafruit LSM303AGR on its default I2C bus:
 
 The node samples acceleration and magnetic field at 10 Hz and sends a
 diagnostic packet once per second. The CYD home panel shows `Mag ...M` for
-node 2. The debug panel shows magnetic heading, `Bx/By/Bz` in microtesla,
-`Ax/Ay/Az` in g, field magnitude, roll, and pitch. USB serial output includes
+both nodes. The debug panel currently shows Node 2's magnetic heading,
+`Bx/By/Bz` in microtesla, `Ax/Ay/Az` in g, field magnitude, roll, and pitch. USB serial output includes
 the same raw vectors.
 
 The CYD magnetic heading marked `M` remains a raw diagnostic. The calibration
 increment supplies a separate corrected, tilt-compensated true heading after
 sensor calibration and mounting/declination setup. Neither replaces the
 simulated rotator feedback yet; see [calibration](docs/calibration.md).
+
+The CYD home cards start **OFFLINE** until a valid packet arrives from the
+configured node MAC. Status, command acknowledgments, raw sensor telemetry,
+and calibration reports all count as communication. After five seconds
+without a packet, the card redraws **OFFLINE** even when neither node sends
+anything. Receipt of a new valid packet restores **ONLINE**. Raw sensor
+readings expire separately after three seconds, and stale motion flags do not
+keep the slewing indicator blinking while offline. Link transitions appear
+in the CYD event log and USB serial output as `LINK N1 OFFLINE`, for example.
+
+For an idle bench node with a standard ESP32 USB auto-reset circuit,
+`tests/hardware_link_smoke.py --gateway-port COM10 --reset-node-port COM11
+--node 1` exercises link loss and recovery by holding that node in reset.
+This discards its unsaved RAM settings; it does not change NVS or send rotator
+commands. The other node must remain connected. Verify port identities first.
+`tests/hardware_calibration_smoke.py` also accepts `--node 1` or `--node 2`.
 
 ## Host Antenna Controller and backup relay
 

@@ -1,16 +1,23 @@
 # Node sensor calibration
 
-The host fits calibration from raw telemetry. Node 2 applies the coefficients
-and can save them in ESP32 Preferences/NVS flash. A reboot reloads the saved
+The host fits calibration from raw telemetry. Both sensor-equipped remote
+nodes apply their own coefficients and can save them in ESP32 Preferences/NVS
+flash. A reboot reloads the saved
 record. Updating coefficients in RAM does not write flash; `save` is explicit.
 The CYD forwards calibration commands and node responses over ESP-NOW. The
 optional Pi relay supports the same commands over direct node USB serial.
 
-Update the CYD and node-2 firmware together before using these commands, then
+Update the CYD and remote-node firmware before using these commands, then
 restart AC with the updated Python environment (`uv sync --inexact`). Press
 `c` or click **Cal** in the TUI for instructions. Enter commands in the manual
 field (`u`). Status and progress appear in the calibration panel and log.
-Node 1 currently has no sensor; it rejects calibration operations.
+Both remote firmware targets now enable the LSM303AGR on SDA GPIO21 / SCL
+GPIO22. Select Node 1 or Node 2 in the host's node selector to view its
+calibration panel and instructions. Entering a `cal 1 ...` or `cal 2 ...`
+command also switches the calibration panel to that node. With "All" selected,
+the panel keeps the most recently selected calibration node (initially Node 2).
+The examples below use Node 2; replace `cal 2` with `cal 1` for Node 1. Capture
+buffers, files, applied coefficients, and saved records are independent per node.
 
 ## Capture and fit
 
