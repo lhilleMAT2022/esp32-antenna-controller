@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import platform
+import statistics
 from collections import deque
 import socket
 import socketserver
@@ -23,7 +24,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .calibration import CalibrationManager
+from .calibration import CalibrationManager, FACES
+from .runtime import MODE_TIMEOUTS, MODES, ReportingControl
 
 LOGGER = logging.getLogger("antenna_controller")
 SERIAL_BAUD = 115200
@@ -58,6 +60,9 @@ def parse_board_line(line: str | bytes) -> dict[str, Any] | None:
         "rc",
         "cc",
         "cs",
+        "rm",
+        "gt",
+        "gs",
     }:
         return None
     return message
@@ -118,6 +123,17 @@ class NodeState:
     sensor_flags: int = 0
     rssi_at_gateway_dbm: float | None = None
     rssi_at_node_dbm: float | None = None
+    reporting_mode: str = "unknown"
+    quiet_remaining_ms: int = 0
+    report_received_monotonic: float = 0
+    sensor_received_monotonic: float = 0
+    node_utc_ms: int | None = None
+    sync_age_ms: int | None = None
+    sync_step_ms: int | None = None
+    node_cyd_offset_ms: float | None = None
+    node_pc_offset_ms: float | None = None
+    cyd_jitter_ms: float | None = None
+    pc_jitter_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -200,18 +216,57 @@ class NodeStateStore:
     )
     route_last_seen: dict[tuple[int, str], float] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    route_modes: dict[tuple[int, str], str] = field(default_factory=dict)
+    status_sequence: dict[int, tuple[int, int]] = field(default_factory=dict)
+    retired_boots: dict[int, deque] = field(default_factory=lambda: {1: deque(maxlen=8), 2: deque(maxlen=8)})
+    clock_samples: dict[tuple[int, str], deque] = field(default_factory=dict)
 
     def update(self, message: dict[str, Any], route: str) -> NodeState | None:
         node_id = message.get("n")
-        if node_id not in (1, 2):
+        if node_id not in (1, 2) or message.get("t") not in ("rp", "rs"):
             return None
         now_ms = int(time.time() * 1000)
         with self.lock:
             state = self.nodes[node_id]
-            self.route_last_seen[(node_id, route)] = time.monotonic()
-            state.route = route
-            state.measured_utc_ms = now_ms
             if message.get("t") == "rp":
+                mode = message.get("mode")
+                boot, sequence = message.get("boot"), message.get("q")
+                if isinstance(boot, int) and isinstance(sequence, int):
+                    previous = self.status_sequence.get(node_id)
+                    if boot in self.retired_boots[node_id]:
+                        return None
+                    if previous and previous[0] != boot:
+                        self.retired_boots[node_id].append(previous[0])
+                        for key in list(self.clock_samples):
+                            if key[0] == node_id:
+                                del self.clock_samples[key]
+                    if previous and previous[0] == boot and ((sequence-previous[1]) & 0xffffffff) >= 0x80000000:
+                        return None
+                    self.status_sequence[node_id] = (boot, sequence)
+                if mode in MODES:
+                    self.route_modes[(node_id, route)] = mode
+                    state.reporting_mode = mode
+                    state.quiet_remaining_ms = max(0, int(message.get("quiet_left_ms", 0)))
+                state.report_received_monotonic = time.monotonic()
+                timestamp = message.get("ts_ms", int(message.get("ts", 0))*1000)
+                state.node_utc_ms = int(timestamp) if message.get("tv", bool(timestamp)) and timestamp > 0 else None
+                age = message.get("sync_age_ms")
+                state.sync_age_ms = age if isinstance(age, int) and 0 <= age < 0xffffffff else None
+                state.sync_step_ms = message.get("sync_step_ms")
+                if state.node_utc_ms:
+                    state.node_pc_offset_ms = state.node_utc_ms-now_ms
+                    samples = self.clock_samples.setdefault((node_id, route + "-pc"), deque(maxlen=60))
+                    samples.append(state.node_pc_offset_ms)
+                    state.pc_jitter_ms = statistics.pstdev(samples) if len(samples) > 1 else None
+                    gateway_rx = message.get("gw_rx_ms")
+                    if gateway_rx:
+                        state.node_cyd_offset_ms = state.node_utc_ms-int(gateway_rx)
+                        samples = self.clock_samples.setdefault((node_id, "gateway"), deque(maxlen=60))
+                        samples.append(state.node_cyd_offset_ms)
+                        state.cyd_jitter_ms = statistics.pstdev(samples) if len(samples) > 1 else None
+                else:
+                    state.node_pc_offset_ms = state.node_cyd_offset_ms = None
+                    state.cyd_jitter_ms = state.pc_jitter_ms = None
                 state.heading_deg = _finite_or_none(message.get("h"))
                 state.target_deg = _finite_or_none(message.get("tg"))
                 state.moving = bool(message.get("mv", 0))
@@ -224,6 +279,7 @@ class NodeStateStore:
                 error = message.get("e", 0)
                 state.fault_code = None if error in (0, None) else str(error)
             elif message.get("t") == "rs":
+                state.sensor_received_monotonic = time.monotonic()
                 state.magnetic_heading_deg = _finite_or_none(message.get("mh"))
                 state.magnetic_ut = _vector(message.get("m"))
                 state.acceleration_g = _vector(message.get("a"))
@@ -231,13 +287,19 @@ class NodeStateStore:
                 state.roll_deg = _finite_or_none(message.get("r"))
                 state.pitch_deg = _finite_or_none(message.get("p"))
                 state.sensor_flags = int(message.get("sf", 0))
+            self.route_last_seen[(node_id, route)] = time.monotonic()
+            state.route = route
+            state.measured_utc_ms = now_ms
             return NodeState(**vars(state))
 
     def route_fresh(
-        self, node_id: int, route: str, max_age_s: float = ROUTE_STALE_SECONDS
+        self, node_id: int, route: str, max_age_s: float | None = None
     ) -> bool:
         with self.lock:
             seen = self.route_last_seen.get((node_id, route))
+            if max_age_s is None:
+                max_age_s = (MODE_TIMEOUTS.get(self.route_modes.get((node_id, route)), ROUTE_STALE_SECONDS)
+                             if route == "gateway" else ROUTE_STALE_SECONDS)
         return seen is not None and time.monotonic() - seen <= max_age_s
 
     def route_age(self, node_id: int, route: str) -> float | None:
@@ -633,6 +695,9 @@ class AntennaController:
         self._client_count = 0
         self._client_lock = threading.Lock()
         self.calibration = CalibrationManager(self._send_calibration, self._report_calibration)
+        self.reporting = ReportingControl(self._send_calibration, self._report_reporting)
+        self.pending_capture: list[str] | None = None
+        self.gateway_status: dict[str, Any] = {}
         self._stop = threading.Event()
         self._server = self._make_command_server(command_host, command_port)
         self._server_thread = threading.Thread(
@@ -641,7 +706,7 @@ class AntennaController:
             daemon=True,
         )
         self._timer_thread = threading.Thread(
-            target=self._time_sync_loop, name="backup-time-sync", daemon=True
+            target=self._time_sync_loop, name="clock-sync", daemon=True
         )
 
     def start(self) -> None:
@@ -733,6 +798,9 @@ class AntennaController:
     def _handle_board_message(
         self, message: dict[str, Any], route: str
     ) -> None:
+        if message.get("t") == "gs":
+            self.gateway_status = dict(message, received_utc_ms=int(time.time()*1000), received_monotonic=time.monotonic())
+            return
         self.calibration.ingest(message)
         if message.get("t") == "cs":
             return
@@ -749,6 +817,10 @@ class AntennaController:
         state = self.states.update(message, route)
         if state is None:
             return
+        if message.get("t") == "rp":
+            self.reporting.ingest(message)
+            self.calibration.observe_runtime(message, MODE_TIMEOUTS.get(state.reporting_mode, 3.5) if route == "gateway" else 3.5)
+            self._service_pending_capture()
         self._publish_state(state)
         if message.get("t") == "rp":
             heading = "---" if state.heading_deg is None else f"{state.heading_deg:.1f}"
@@ -783,7 +855,7 @@ class AntennaController:
             and 20.0 <= state.field_strength_ut <= 70.0
         )
         message = {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0",
             "message_type": "antenna_state",
             "message_id": str(uuid.uuid4()),
             "source": "AntennaController",
@@ -809,6 +881,11 @@ class AntennaController:
             ),
             "fault_code": state.fault_code,
             "node_last_heard_utc_ms": state.measured_utc_ms,
+            "node_time_utc_ms": state.node_utc_ms,
+            "reporting_mode": state.reporting_mode,
+            "quiet_remaining_s": max(0, math.ceil(state.quiet_remaining_ms/1000 - (time.monotonic()-state.report_received_monotonic))) if state.reporting_mode == "quiet" else 0,
+            "node_cyd_offset_ms": state.node_cyd_offset_ms,
+            "node_pc_offset_ms": state.node_pc_offset_ms,
         }
         try:
             self.state_socket.sendto(
@@ -841,6 +918,50 @@ class AntennaController:
 
     def _report_calibration(self, node_id: int, detail: str) -> None:
         self._record_event("CALIBRATION", detail, source=f"node{node_id}", route="calibration")
+
+    def _report_reporting(self, node_id: int, detail: str) -> None:
+        self._record_event("REPORTING", detail, source=f"node{node_id}", route="reporting")
+
+    def set_reporting_mode(self, mode: str, seconds: int = 0) -> str:
+        with self.reporting.lock:
+            if mode != "continuous" and (self.pending_capture or any(s.mode for s in self.calibration.nodes.values())):
+                raise ValueError("Cancel active calibration captures before reducing the reporting rate")
+            return self.reporting.command(mode, seconds)
+
+    def calibration_command(self, fields: list[str]) -> str:
+        with self.reporting.lock:
+            return self._calibration_command(fields)
+
+    def _calibration_command(self, fields: list[str]) -> str:
+        capture = len(fields) == 3 and (fields[1:] == ["start", "mag"] or fields[1] == "face" and fields[2] in FACES)
+        if capture and fields[0] in ("1", "2"):
+            self.reporting.expire()
+            if self.reporting.pending:
+                raise ValueError("Wait for the pending reporting-mode request before starting capture")
+            ready = all(s.reporting_mode == "continuous" and
+                        (self.states.route_fresh(s.node_id, "gateway") or self.states.route_fresh(s.node_id, "backup"))
+                        for s in self.states.snapshot())
+            if not ready:
+                self.set_reporting_mode("continuous")
+                self.pending_capture = list(fields)
+                self._service_pending_capture()
+                return "Switching both nodes to continuous; capture starts after both nodes confirm"
+        if len(fields) >= 2 and fields[1] == "cancel":
+            self.pending_capture = None
+        return self.calibration.command(fields)
+
+    def _service_pending_capture(self) -> None:
+        with self.reporting.lock:
+            self.reporting.expire()
+            if self.pending_capture and not self.reporting.pending:
+                fields, self.pending_capture = self.pending_capture, None
+                if self.reporting.confirmed():
+                    try:
+                        self.calibration.command(fields)
+                    except (ValueError, RuntimeError) as exc:
+                        self._report_calibration(int(fields[0]), f"Capture did not start: {exc}")
+                else:
+                    self._report_calibration(int(fields[0]), "Capture did not start: continuous reporting was not confirmed by both nodes")
 
     def _send_rotator_command(
         self,
@@ -950,16 +1071,14 @@ class AntennaController:
             )
 
     def _time_sync_loop(self) -> None:
-        while not self._stop.wait(30.0):
-            if self.backup and self.backup.connected.is_set():
-                self.command_sequence += 1
-                message = compact_rotator_command(
-                    2,
-                    self.command_sequence,
-                    "time",
-                    execute_at_utc_s=int(time.time()),
-                )
+        while not self._stop.is_set():
+            self._service_pending_capture()
+            message = {"t": "gt", "utc_ms": int(time.time()*1000)}
+            if self.primary.connected.is_set():
+                self.primary.send(message)
+            elif self.backup and self.backup.connected.is_set():
                 self.backup.send(message)
+            self._stop.wait(3.0)
 
     @staticmethod
     def _format_state(state: NodeState) -> str:

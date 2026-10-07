@@ -8,6 +8,30 @@ rotator-mounted Yagis. Its intended implementation comprises a Cheap Yellow
 Display (CYD) USB gateway and local operator console, two ESP32 antenna nodes
 connected over ESP-NOW, node firmware, and a host-side control adapter.
 
+## Current development snapshot — 2026-10-07
+
+Both nodes now appear in the TUI calibration panel with A/B XYZ and
+magnitude/azimuth°/elevation° (MAE). Health shows actual reporting mode,
+quiet time remaining, node/CYD/PC UTC comparisons, sync correction and age.
+The CYD debug view shows both nodes' vectors and sample age, omits roll/pitch,
+and has a live UTC header once the PC supplies time.
+
+Use the **Reporting** button or `report continuous`, `report normal`,
+`report quiet 300`. Normal is the boot default (10-second radio reports).
+Quiet sends a heartbeat every minute and sensor reports for unexpected
+rotation **>10°**; commanded movement gets 10-second updates and a completion
+report. Its timer returns the nodes to normal. Serial remains at 1 Hz.
+Calibration capture automatically requests continuous for both nodes and
+waits for their acknowledgments.
+
+Protocol **4 requires updating CYD and both remote nodes together**. The
+runtime increment has passed 44 host/native/TUI tests and all three firmware
+builds; hardware deployment and acceptance for this increment are pending.
+Physical relay actuation and calibration save/power-cycle acceptance remain
+unfinished. See [node runtime specification](docs/node-runtime.md) for rates,
+wire fields, clock interpretation and verification. The snapshots below are
+historical checkpoints, not the current feature list.
+
 ## Development checkpoint — 2026-10-06 (before calibration)
 
 Recovered from session `01a10de7-c1c2-7c92-8e38-c253e108b109`.

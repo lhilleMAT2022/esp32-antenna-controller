@@ -4,6 +4,7 @@
 #include <esp_wifi.h>
 #include <math.h>
 #include <Preferences.h>
+#include <esp_timer.h>
 
 #ifdef ANTENNA_NODE_HAS_LSM303AGR
 #include <Adafruit_LIS2MDL.h>
@@ -14,6 +15,7 @@
 #include "espnow_smoke_config.h"
 #include "serial_json_protocol.h"
 #include "calibration_protocol.h"
+#include "runtime_protocol.h"
 
 #ifndef ANTENNA_NODE_ID
 #error "ANTENNA_NODE_ID must be defined by the PlatformIO environment"
@@ -75,10 +77,15 @@ volatile uint8_t receiveQueueWriteIndex = 0;
 volatile uint8_t receiveQueueReadIndex = 0;
 volatile int8_t cydRssiDbm = RssiUnavailable;
 volatile uint32_t cydRssiUpdatedMs = 0;
-uint32_t nextStatusMs = 500 + NodeId * 100;
+uint32_t lastSerialReportMs = 0;
+bool serialReported = false;
 uint32_t sequenceNumber = 0;
 bool timeValid = false;
-int32_t epochOffsetSeconds = 0;
+UtcClock utcClock;
+ReportingPolicy reporting;
+OrientationReference quietOrientation;
+ReportingRequests reportingRequests;
+uint8_t lastCalibrationFlags = 0;
 ScheduledCommand scheduledCommands[ScheduledCommandCount]{};
 
 float mechanicalPositionDeg = NodeId == 1 ? 95.0F : 270.0F;
@@ -120,19 +127,12 @@ int signOf(float value) {
 }
 
 uint32_t epochNow() {
-    return timeValid
-               ? static_cast<uint32_t>(
-                     static_cast<int32_t>(millis() / 1000) + epochOffsetSeconds)
-               : 0;
+    return uint32_t(utcClock.at(uint64_t(esp_timer_get_time())/1000)/1000);
 }
 
-void synchronizeTime(uint32_t epochSeconds) {
-    if (epochSeconds == 0) {
-        return;
-    }
-    epochOffsetSeconds =
-        static_cast<int32_t>(epochSeconds) - static_cast<int32_t>(millis() / 1000);
-    timeValid = true;
+void synchronizeTime(uint64_t epochMilliseconds) {
+    utcClock.synchronize(epochMilliseconds, uint64_t(esp_timer_get_time())/1000);
+    timeValid = utcClock.valid;
 }
 
 float trueAzimuthDeg() {
@@ -226,7 +226,8 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
 
 void onDataReceived(const uint8_t* source, const uint8_t* data, int dataLength) {
     if (!macMatches(source, CydGatewayMac) ||
-        (dataLength != sizeof(Packet) && dataLength != sizeof(CalibrationCommand))) {
+        (dataLength != sizeof(Packet) && dataLength != sizeof(CalibrationCommand) &&
+         dataLength != sizeof(ReportingCommand))) {
         return;
     }
 
@@ -264,8 +265,10 @@ bool initializeEspNow() {
     return esp_now_add_peer(&peerInfo) == ESP_OK;
 }
 
-void sendPacket(PacketType packetType, CommandType command = CommandType::None) {
-    const Packet packet{
+void sendPacket(PacketType packetType, CommandType command = CommandType::None,
+                bool radio = true, bool serialOutput = true,
+                uint32_t reportingRequest = 0, uint8_t reportingError = 0) {
+    Packet packet{
         static_cast<uint8_t>(packetType),
         NodeId,
         ProtocolVersion,
@@ -277,37 +280,22 @@ void sendPacket(PacketType packetType, CommandType command = CommandType::None) 
         NoAzimuthDeciDegrees,
         static_cast<uint8_t>(command),
         latestCydRssi()};
-    const esp_err_t result =
-        esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&packet),
-                     sizeof(packet));
-    Serial.printf("TX %s az=%.1fT target=%.1fT %s\n",
-                  packetType == PacketType::Status
-                      ? "status"
-                      : packetType == PacketType::CommandAcknowledgment
-                            ? "command-ack"
-                            : "packet",
-                  trueAzimuthDeg(),
-                  targetTrueAzimuthDeciDegrees() == NoAzimuthDeciDegrees
-                      ? -1.0F
-                      : targetTrueAzimuthDeciDegrees() / 10.0F,
-                  result == ESP_OK ? "queued" : "failed");
-    Serial.printf(
-        "{\"t\":\"rp\",\"n\":%u,\"q\":%lu,\"ts\":%lu,\"h\":%.1f,"
-        "\"tg\":",
-        NodeId, static_cast<unsigned long>(packet.sequence),
-        static_cast<unsigned long>(packet.epochSeconds),
-        packet.azimuthDeciDegrees / 10.0F);
-    if (packet.targetDeciDegrees == NoAzimuthDeciDegrees) {
-        Serial.print("null");
-    } else {
-        Serial.printf("%.1f", packet.targetDeciDegrees / 10.0F);
-    }
-    Serial.printf(
-        ",\"mv\":%u,\"e\":0,\"ack\":%u,\"src\":\"node_serial\"}\n",
-        hasFlag(packet.flags, StatusFlag::Moving) ? 1U : 0U,
-        packetType == PacketType::CommandAcknowledgment
-            ? static_cast<unsigned int>(packet.commandType)
-            : 0U);
+    const uint64_t now = uint64_t(esp_timer_get_time())/1000;
+    packet.utcMilliseconds = utcClock.at(now); packet.uptimeMs = millis();
+    packet.reportingMode = uint8_t(reporting.mode); packet.quietRemainingMs = reporting.remaining(millis());
+    packet.clockSyncAgeMs = utcClock.syncAge(now); packet.clockCorrectionMs = utcClock.correctionMs;
+    packet.reportingRequest = reportingRequest; packet.reportingError = reportingError;
+    packet.boot = calibrationBoot; packet.calibrationFlags = lastCalibrationFlags;
+    if (radio) esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+    if (serialOutput) emitRuntimeStatus(packet, "node_serial");
+}
+
+void handleReportingCommand(const ReportingCommand& command) {
+    if (command.node != NodeId || !command.request || command.type != 8 || command.version != ProtocolVersion) return;
+    bool changed = false;
+    const uint8_t error = reportingRequests.apply(command, reporting, millis(), &changed);
+    if (changed) quietOrientation.valid = false;
+    sendPacket(PacketType::ReportingAcknowledgment, CommandType::None, true, true, command.request, error);
 }
 
 #ifdef ANTENNA_NODE_HAS_LSM303AGR
@@ -391,7 +379,7 @@ uint8_t sensorFlags() {
     return flags;
 }
 
-void sendSensorTelemetry() {
+void sendSensorTelemetry(bool radio = true, bool serialOutput = true) {
     const int16_t magneticHeading =
         magnetometerValid
             ? scaledSensorValue(magneticHeadingDeg, 10.0F)
@@ -443,38 +431,8 @@ void sendSensorTelemetry() {
         rollValue,
         pitchValue};
 
-    const esp_err_t result =
-        esp_now_send(CydGatewayMac,
-                     reinterpret_cast<const uint8_t*>(&telemetry),
-                     sizeof(telemetry));
-    if (magnetometerValid && accelerometerValid) {
-        const float fieldMagnitude =
-            sqrtf(magneticX * magneticX + magneticY * magneticY +
-                  magneticZ * magneticZ);
-        Serial.printf(
-            "SENSOR heading=%.1fM mag=(%.1f,%.1f,%.1f)uT |B|=%.1fuT "
-            "accel=(%.3f,%.3f,%.3f)g roll=%.1f pitch=%.1f tx=%s\n",
-            magneticHeadingDeg, magneticX, magneticY, magneticZ, fieldMagnitude,
-            accelerationX / StandardGravityMetersPerSecondSquared,
-            accelerationY / StandardGravityMetersPerSecondSquared,
-            accelerationZ / StandardGravityMetersPerSecondSquared, rollDeg,
-            pitchDeg, result == ESP_OK ? "queued" : "failed");
-        Serial.printf(
-            "{\"t\":\"rs\",\"n\":%u,\"q\":%lu,\"mh\":%.1f,"
-            "\"m\":[%.1f,%.1f,%.1f],\"a\":[%.3f,%.3f,%.3f],"
-            "\"f\":%.1f,\"r\":%.1f,\"p\":%.1f,\"sf\":%u,"
-            "\"src\":\"node_serial\"}\n",
-            NodeId, static_cast<unsigned long>(telemetry.sequence),
-            magneticHeadingDeg, magneticX, magneticY, magneticZ,
-            accelerationX / StandardGravityMetersPerSecondSquared,
-            accelerationY / StandardGravityMetersPerSecondSquared,
-            accelerationZ / StandardGravityMetersPerSecondSquared,
-            fieldMagnitude, rollDeg, pitchDeg, telemetry.flags);
-    } else {
-        Serial.printf("SENSOR unavailable flags=0x%02X tx=%s\n",
-                      telemetry.flags,
-                      result == ESP_OK ? "queued" : "failed");
-    }
+    if (radio) esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&telemetry), sizeof(telemetry));
+    if (serialOutput) emitRawSensor(telemetry, "node_serial");
 }
 #endif
 
@@ -507,7 +465,7 @@ bool persistCalibration(CalibrationConfig candidate) {
     return ok;
 }
 
-void sendCalibrationReport(uint32_t request = 0, uint8_t error = 0) {
+void sendCalibrationReport(uint32_t request = 0, uint8_t error = 0, bool radio = true, bool serialOutput = true) {
     CalibrationReport report{};
     report.type = 7; report.node = NodeId; report.version = ProtocolVersion;
     report.sequence = ++sequenceNumber; report.boot = calibrationBoot;
@@ -535,8 +493,9 @@ void sendCalibrationReport(uint32_t request = 0, uint8_t error = 0) {
         report.heading = heading; report.tilt = tilt;
     }
 #endif
-    esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&report), sizeof(report));
-    emitCalibrationJson(report, "node_serial");
+    lastCalibrationFlags = report.flags;
+    if (radio) esp_now_send(CydGatewayMac, reinterpret_cast<const uint8_t*>(&report), sizeof(report));
+    if (serialOutput) emitCalibrationJson(report, "node_serial");
 }
 
 void handleCalibrationCommand(const CalibrationCommand& command) {
@@ -758,6 +717,12 @@ void processReceivedPackets() {
         const ReceivedPacket received = receiveQueue[receiveQueueReadIndex];
         receiveQueueReadIndex =
             (receiveQueueReadIndex + 1) % ReceiveQueueSize;
+        if (received.length == sizeof(ReportingCommand)) {
+            ReportingCommand command{};
+            memcpy(&command, received.payload, sizeof(command));
+            handleReportingCommand(command);
+            continue;
+        }
         if (received.length == sizeof(CalibrationCommand)) {
             CalibrationCommand command{};
             memcpy(&command, received.payload, sizeof(command));
@@ -771,7 +736,7 @@ void processReceivedPackets() {
             continue;
         }
         if (packet.packetType == static_cast<uint8_t>(PacketType::TimeSync)) {
-            synchronizeTime(packet.epochSeconds);
+            synchronizeTime(packet.utcMilliseconds);
         } else if (packet.packetType ==
                    static_cast<uint8_t>(PacketType::Command)) {
             handleCommand(packet);
@@ -790,6 +755,16 @@ void emitSerialCommandResult(const SerialRotatorCommand& command,
 }
 
 void handleSerialJson(char* line) {
+    ReportingCommand reportingCommand{};
+    if (parseReportingCommand(line, &reportingCommand)) {
+        handleReportingCommand(reportingCommand);
+        return;
+    }
+    uint64_t utcMs = 0;
+    if (parseClockCommand(line, &utcMs)) {
+        synchronizeTime(utcMs);
+        return;
+    }
     CalibrationCommand calibrationCommand{};
     if (parseCalibrationCommand(line, &calibrationCommand)) {
         handleCalibrationCommand(calibrationCommand);
@@ -804,7 +779,7 @@ void handleSerialJson(char* line) {
     }
 
     if (serialCommand.command == CommandType::None) {
-        synchronizeTime(serialCommand.executeAtEpochSeconds);
+        synchronizeTime(uint64_t(serialCommand.executeAtEpochSeconds)*1000);
         emitSerialCommandResult(serialCommand, true, "time synchronized");
         return;
     }
@@ -874,12 +849,27 @@ void loop() {
     digitalWrite(BuiltInLedPin, modelButtonPressed ? HIGH : LOW);
 
     const uint32_t nowMs = millis();
-    if (nowMs >= nextStatusMs) {
-        sendPacket(PacketType::Status);
+    const bool moving = isMoving();
+    float unexpectedTurn = NAN;
 #ifdef ANTENNA_NODE_HAS_LSM303AGR
-        sendSensorTelemetry();
+    float correctedMag[3], correctedAccel[3];
+    const float rawMag[3] = {magneticX, magneticY, magneticZ};
+    const float rawAccel[3] = {accelerationX/StandardGravityMetersPerSecondSquared,
+        accelerationY/StandardGravityMetersPerSecondSquared, accelerationZ/StandardGravityMetersPerSecondSquared};
+    correctVector(rawMag, calibration.magOffset, calibration.magMatrix, correctedMag);
+    correctVector(rawAccel, calibration.accelOffset, calibration.accelMatrix, correctedAccel);
+    if (magnetometerValid && accelerometerValid)
+        unexpectedTurn = quietOrientation.change(correctedAccel, correctedMag,
+                                                moving || reporting.mode != ReportingMode::Quiet);
 #endif
-        sendCalibrationReport();
-        nextStatusMs = nowMs + StatusPeriodMs;
-    }
+    const RadioReports radio = reporting.poll(nowMs, moving, unexpectedTurn);
+    const bool serialTick = !serialReported || nowMs-lastSerialReportMs >= StatusPeriodMs;
+    if (serialTick) { lastSerialReportMs = nowMs; serialReported = true; }
+    if (serialTick || radio.sensor) sendCalibrationReport(0, 0, radio.sensor, serialTick);
+    if (serialTick || radio.heartbeat) sendPacket(PacketType::Status, CommandType::None, radio.heartbeat, serialTick);
+#ifdef ANTENNA_NODE_HAS_LSM303AGR
+    if (serialTick || radio.sensor) sendSensorTelemetry(radio.sensor, serialTick);
+    if (radio.sensor && magnetometerValid && accelerometerValid)
+        quietOrientation.change(correctedAccel, correctedMag, true);
+#endif
 }

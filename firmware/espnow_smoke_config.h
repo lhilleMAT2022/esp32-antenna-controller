@@ -14,7 +14,7 @@ constexpr uint8_t Channel = 1;
 constexpr uint32_t TimeSyncPeriodMs = 3000;
 constexpr uint32_t StatusPeriodMs = 1000;
 constexpr uint8_t AntennaNodeCount = 2;
-constexpr uint8_t ProtocolVersion = 3;
+constexpr uint8_t ProtocolVersion = 4;
 constexpr int8_t RssiUnavailable = 127;
 constexpr int16_t NoAzimuthDeciDegrees = -1;
 
@@ -30,6 +30,8 @@ enum class PacketType : uint8_t {
     CommandAcknowledgment = 3,
     TimeSync = 4,
     SensorTelemetry = 5,
+    ReportingCommand = 8,
+    ReportingAcknowledgment = 9,
 };
 
 enum class CommandType : uint8_t {
@@ -67,9 +69,19 @@ struct __attribute__((packed)) Packet {
     int16_t commandValueDeciDegrees;
     uint8_t commandType;
     int8_t receiverRssiDbm;
+    uint64_t utcMilliseconds;
+    uint32_t uptimeMs;
+    uint8_t reportingMode;
+    uint32_t quietRemainingMs;
+    uint32_t clockSyncAgeMs;
+    int32_t clockCorrectionMs;
+    uint32_t reportingRequest;
+    uint8_t reportingError;
+    uint32_t boot;
+    uint8_t calibrationFlags;
 };
 
-static_assert(sizeof(Packet) == 20, "Antenna-controller packet size changed");
+static_assert(sizeof(Packet) == 55, "Antenna-controller packet size changed");
 
 struct __attribute__((packed)) SensorTelemetry {
     uint8_t packetType;

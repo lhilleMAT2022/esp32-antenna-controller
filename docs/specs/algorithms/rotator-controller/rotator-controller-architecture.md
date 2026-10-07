@@ -2,7 +2,7 @@
 
 ## Status: Draft
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-07
 **Parent:** [System specification](rotator-controller-system.md)
 
 ## Functional decomposition
@@ -33,8 +33,9 @@ The command route is single-path:
 
 1. Node 1 always uses CYD/ESP-NOW.
 2. Node 2 normally uses CYD/ESP-NOW.
-3. Node 2 uses the Pi route when primary telemetry is older than 3.5 s and Pi
-   telemetry is fresh, or when `--prefer-backup-node2` is selected.
+3. Node 2 uses the Pi route when primary telemetry exceeds its mode timeout
+   (5/25/90 s for continuous/normal/quiet) and Pi telemetry is fresh (3.5 s),
+   or when `--prefer-backup-node2` is selected.
 4. Commands are not broadcast over both paths, preventing duplicate physical
    button actions when relay actuation is introduced.
 
@@ -45,9 +46,11 @@ protection.
 
 ## Packet contract
 
-Protocol version 3 uses a packed 20-byte rotator `Packet` and a separate
-26-byte raw `SensorTelemetry` packet. The calibration increment adds 56-byte
-commands (type 6) and 52-byte reports (type 7), preserving existing layouts.
+Protocol version 4 uses a packed 55-byte rotator `Packet`, 26-byte raw
+`SensorTelemetry`, 56-byte calibration command and 52-byte calibration report.
+Reporting commands are 12 bytes; their ACK uses the 55-byte Packet.
+All three boards must be upgraded together. See [runtime contract](../../../node-runtime.md)
+for appended fields, clock semantics, reporting states and acknowledgments.
 
 | Field | Unit | Meaning |
 |---|---|---|
@@ -125,12 +128,16 @@ press. This tiny modeled motion is intentional.
 | Component | Rate | Initialization |
 |---|---:|---|
 | Node plant/model | Every loop; elapsed time capped at 100 ms | Node 1 starts q=95°, node 2 q=270° |
-| Node status | 1 Hz | Reports time-invalid until CYD sync |
-| CYD time sync | Every 3 s and after `TIME` | UTC invalid after a CYD reset |
+| Node RF status | 1/10/60 s by mode | Normal at boot; UTC invalid until sync |
+| CYD time sync | Every 3/10/60 s by node mode | PC seeds UTC over USB every 3 s |
 | Display refresh | On status/event change and each UTC second | Home panel selected |
-| Sensor sample | 10 Hz on node 2 | Diagnostic only |
+| Sensor sample | 10 Hz on both nodes | Raw and corrected diagnostics |
 | Compact serial status | 1 Hz per attached node | Same values as ESP-NOW status |
 | Host AC backup freshness | 3.5 s | Primary route preferred |
+
+Reporting modes, quiet motion exceptions and clock diagnostics are specified
+in [Node runtime](../../../node-runtime.md). The tables above supersede the
+original v0.1 reporting schedule.
 
 ## Key decisions
 

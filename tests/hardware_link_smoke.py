@@ -72,7 +72,8 @@ def main():
                 gateway.reset_input_buffer()
                 started = time.monotonic()
                 target.rts = True
-                wait_line(gateway, lambda line: line == f'LINK N{node} OFFLINE', timeout=9)
+                # Boot-default normal mode uses a 25-second link timeout.
+                wait_line(gateway, lambda line: line == f'LINK N{node} OFFLINE', timeout=35)
                 print(f'OFFLINE after {time.monotonic() - started:.2f} s in reset', flush=True)
                 check_status(gateway, [f'N{node} OFFLINE', f'N{other} ONLINE'])
             finally:

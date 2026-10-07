@@ -2,6 +2,19 @@
 
 ## Overview
 
+Implemented runtime update (2026-10-07): the Calibration tab always shows
+both nodes' calibration status and raw A/B XYZ + MAE (magnitude, azimuth°,
+elevation°), with sample age. Selection controls calibration help, not which
+node is visible. Health shows each reported mode, quiet seconds remaining,
+node UTC and age, CYD/PC offsets, jitter and synchronization diagnostics.
+
+The **Reporting** button controls both nodes: Continuous, Normal, or Quiet
+with a duration (default 300 s, valid 1–86400 s). Manual equivalents are
+`report continuous`, `report normal`, and `report quiet 300`. Each node must
+acknowledge; partial success and timeout are shown. Starting calibration
+capture first requests continuous globally. See the
+[runtime specification](docs/node-runtime.md) for clock and vector conventions.
+
 The Antenna Controller (AC) TUI is an SSH-accessible operational console for a distributed ESP32-based antenna pointing system.
 
 The system consists of:

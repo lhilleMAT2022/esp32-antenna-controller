@@ -7,11 +7,13 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <stdarg.h>
+#include <esp_timer.h>
 
 #include "espnow_smoke_config.h"
 #include "serial_json_protocol.h"
 #include "calibration_protocol.h"
 #include "receive_freshness.h"
+#include "runtime_protocol.h"
 
 namespace {
 using namespace antenna_controller;
@@ -20,7 +22,6 @@ constexpr uint8_t DisplayBacklightPin = 21;
 constexpr uint32_t SerialBaudRate = 115200;
 constexpr uint8_t ReceiveQueueSize = 8;
 constexpr uint32_t RssiFreshnessMs = 10000;
-constexpr uint32_t NodeOfflineMs = 5000;
 constexpr uint32_t SensorOfflineMs = 3000;
 constexpr uint8_t EventLogLineCount = 4;
 constexpr uint8_t EventLogLineLength = 42;
@@ -41,7 +42,8 @@ SPIClass touchscreenSpi(VSPI);
 XPT2046_Touchscreen touchscreen(TouchCsPin, TouchIrqPin);
 
 struct ReceivedPacket {
-    uint8_t payload[sizeof(CalibrationReport)];
+    uint8_t payload[64];
+    uint64_t receivedMs;
     uint8_t payloadLength;
     uint8_t sourceMac[6];
 };
@@ -54,6 +56,11 @@ struct NodeStatus {
     int8_t rssiAtNode = RssiUnavailable;
     ReceiveFreshness link;
     uint32_t nodeEpochSeconds = 0;
+    uint64_t nodeUtcMs = 0;
+    ReportingMode mode = ReportingMode::Normal;
+    uint32_t quietRemainingMs = 0;
+    uint32_t lastModeMs = 0;
+    uint32_t lastTimeSyncMs = 0;
     uint8_t sensorFlags = 0;
     int16_t magneticHeadingDeciDegrees = NoAzimuthDeciDegrees;
     int16_t magneticXDeciMicrotesla = 0;
@@ -65,6 +72,7 @@ struct NodeStatus {
     int16_t rollDeciDegrees = 0;
     int16_t pitchDeciDegrees = 0;
     ReceiveFreshness sensor;
+    bool hasSensorSample = false;
 };
 
 ReceivedPacket receiveQueue[ReceiveQueueSize]{};
@@ -79,9 +87,9 @@ char serialLine[SerialLineLength]{};
 size_t serialLineLength = 0;
 bool serialLineOverflow = false;
 uint32_t sequenceNumber = 0;
-uint32_t nextTimeSyncMs = 500;
+uint32_t lastGatewayReportMs = 0;
+UtcClock utcClock;
 uint32_t lastUiClockSecond = UINT32_MAX;
-int32_t epochOffsetSeconds = 0;
 bool timeValid = false;
 Panel activePanel = Panel::Home;
 uint8_t keypadNodeId = 1;
@@ -129,27 +137,23 @@ bool macMatches(const uint8_t* first, const uint8_t* second) {
 
 bool nodeOnline(uint8_t nodeId) {
     const int index = nodeIndex(nodeId);
-    return index >= 0 && nodeStatus[index].link.fresh(millis(), NodeOfflineMs);
+    return index >= 0 && nodeStatus[index].link.fresh(millis(), linkTimeout(nodeStatus[index].mode));
 }
 
 bool sensorTelemetryFresh(uint8_t nodeId) {
     const int index = nodeIndex(nodeId);
-    return index >= 0 && nodeStatus[index].sensor.fresh(millis(), SensorOfflineMs);
+    return index >= 0 && nodeStatus[index].sensor.fresh(millis(), nodeStatus[index].mode == ReportingMode::Quiet ? 90000 : nodeStatus[index].mode == ReportingMode::Normal ? 25000 : SensorOfflineMs);
 }
 
-uint32_t epochNow() {
-    return timeValid
-               ? static_cast<uint32_t>(
-                     static_cast<int32_t>(millis() / 1000) + epochOffsetSeconds)
-               : 0;
-}
+uint64_t utcMilliseconds() { return utcClock.at(uint64_t(esp_timer_get_time())/1000); }
+uint32_t epochNow() { return uint32_t(utcMilliseconds()/1000); }
 
-void setEpoch(uint32_t epochSeconds) {
-    epochOffsetSeconds =
-        static_cast<int32_t>(epochSeconds) - static_cast<int32_t>(millis() / 1000);
-    timeValid = true;
+void setEpochMs(uint64_t epochMs) {
+    utcClock.synchronize(epochMs, uint64_t(esp_timer_get_time())/1000);
+    timeValid = utcClock.valid;
     headerDirty = true;
 }
+void setEpoch(uint32_t epochSeconds) { setEpochMs(uint64_t(epochSeconds)*1000); }
 
 void formatTime(uint32_t epochSeconds, char* buffer, size_t bufferLength) {
     if (!timeValid || epochSeconds == 0) {
@@ -335,64 +339,75 @@ void drawKeypadPanel() {
     }
 }
 
+// Draw the degree glyph explicitly; the built-in small font is ASCII-only.
+void drawDegreeText(const char* text, int x, int y) {
+    const char* part = text;
+    while (*part) {
+        const char* degree = strstr(part, "\xC2\xB0");
+        if (!degree) { display.drawString(part, x, y, 1); break; }
+        char segment[96];
+        const size_t count = size_t(degree-part);
+        if (count >= sizeof(segment)) return;
+        memcpy(segment, part, count); segment[count] = '\0';
+        display.drawString(segment, x, y, 1);
+        x += display.textWidth(segment, 1);
+        display.drawCircle(x+2, y+1, 1, TFT_CYAN);
+        x += 5;
+        part = degree+2;
+    }
+}
+
+void drawVector(uint8_t node, const char* label, float x, float y, float z,
+                const char* units, int precision, int top, bool valid) {
+    char row[96], azimuth[16], elevation[16];
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    if (!valid) {
+        snprintf(row, sizeof(row), "N%u %s XYZ:(---,---,---) / MAE:(---,---,---) %s", node, label, units);
+        display.drawString(row, 4, top, 1);
+        return;
+    }
+    snprintf(row, sizeof(row), "N%u %s XYZ:(%.*f,%.*f,%.*f) %s", node, label, precision, x, precision, y, precision, z, units);
+    display.drawString(row, 4, top, 1);
+    const VectorMae mae = vectorMae(x, y, z);
+    if (isfinite(mae.azimuth)) snprintf(azimuth, sizeof(azimuth), "%.1f\xC2\xB0", mae.azimuth);
+    else snprintf(azimuth, sizeof(azimuth), "---");
+    if (isfinite(mae.elevation)) snprintf(elevation, sizeof(elevation), "%.1f\xC2\xB0", mae.elevation);
+    else snprintf(elevation, sizeof(elevation), "---");
+    snprintf(row, sizeof(row), "     MAE:(%.*f,%s,%s) %s", precision, mae.magnitude, azimuth, elevation, units);
+    drawDegreeText(row, 4, top+12);
+}
+
 void drawDebugPanel() {
     display.fillScreen(TFT_BLACK);
-    drawHeader("DEBUG DIAGNOSTICS");
-    display.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-    display.drawString("Link RSSI / model status", 4, 29, 2);
-    for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
-        const NodeStatus& status = nodeStatus[nodeIndex(nodeId)];
-        char atGateway[8];
-        char atNode[8];
-        char azimuth[12];
-        char row[50];
-        snprintf(row, sizeof(row), "N%u %s  N>G %s G>N %s", nodeId,
-                 azimuthText(status.azimuthDeciDegrees, azimuth, sizeof(azimuth)),
-                 rssiText(status.rssiAtGateway, atGateway, sizeof(atGateway)),
-                 rssiText(status.rssiAtNode, atNode, sizeof(atNode)));
-        display.setTextColor(TFT_WHITE, TFT_BLACK);
-        display.drawString(row, 4, 51 + (nodeId - 1) * 19, 2);
+    drawHeader("DEBUG");
+    for (uint8_t node = 1; node <= AntennaNodeCount; ++node) {
+        const NodeStatus& sensor = nodeStatus[nodeIndex(node)];
+        const int top = node == 1 ? 28 : 101;
+        char row[64];
+        const uint32_t elapsed = millis()-sensor.lastModeMs;
+        const uint32_t remaining = elapsed < sensor.quietRemainingMs ? (sensor.quietRemainingMs-elapsed+999)/1000 : 0;
+        if (sensor.mode == ReportingMode::Quiet)
+            snprintf(row, sizeof(row), "N%u %s quiet %lus | N>G %d dBm", node, nodeOnline(node) ? "ONLINE" : "OFFLINE", (unsigned long)remaining, sensor.rssiAtGateway);
+        else snprintf(row, sizeof(row), "N%u %s %s | N>G %d dBm", node, nodeOnline(node) ? "ONLINE" : "OFFLINE", reportingName(sensor.mode), sensor.rssiAtGateway);
+        display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        display.drawString(row, 4, top, 1);
+        const bool fresh = sensor.hasSensorSample;
+        drawVector(node, "B", sensor.magneticXDeciMicrotesla/10.0F, sensor.magneticYDeciMicrotesla/10.0F,
+                   sensor.magneticZDeciMicrotesla/10.0F, "uT", 1, top+13, fresh && (sensor.sensorFlags & MagnetometerValid));
+        drawVector(node, "A", sensor.accelerationXMilliG/1000.0F, sensor.accelerationYMilliG/1000.0F,
+                   sensor.accelerationZMilliG/1000.0F, "g", 3, top+39, fresh && (sensor.sensorFlags & AccelerometerValid));
+        display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        if (sensor.hasSensorSample)
+            snprintf(row, sizeof(row), "Last raw sample: %lu s ago", (unsigned long)((millis()-sensor.sensor.lastReceivedMs)/1000));
+        else snprintf(row, sizeof(row), "Awaiting raw sample");
+        display.drawString(row, 4, top+65, 1);
     }
-
-    const NodeStatus& sensor = nodeStatus[nodeIndex(2)];
-    if (sensorTelemetryFresh(2)) {
-        const float bx = sensor.magneticXDeciMicrotesla / 10.0F;
-        const float by = sensor.magneticYDeciMicrotesla / 10.0F;
-        const float bz = sensor.magneticZDeciMicrotesla / 10.0F;
-        const float ax = sensor.accelerationXMilliG / 1000.0F;
-        const float ay = sensor.accelerationYMilliG / 1000.0F;
-        const float az = sensor.accelerationZMilliG / 1000.0F;
-        const float magnitude = sqrtf(bx * bx + by * by + bz * bz);
-        char row[52];
-        snprintf(row, sizeof(row), "N2 Mag %.1fM  |B| %.1fuT",
-                 sensor.magneticHeadingDeciDegrees / 10.0F,
-                 magnitude);
-        display.setTextColor(TFT_MAGENTA, TFT_BLACK);
-        display.drawString(row, 4, 89, 2);
-        snprintf(row, sizeof(row), "B x%+.1f y%+.1f z%+.1f uT", bx, by, bz);
-        display.setTextColor(TFT_CYAN, TFT_BLACK);
-        display.drawString(row, 4, 106, 2);
-        snprintf(row, sizeof(row), "A x%+.3f y%+.3f z%+.3f g", ax, ay, az);
-        display.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-        display.drawString(row, 4, 123, 2);
-        snprintf(row, sizeof(row), "Tilt roll %+.1f pitch %+.1f deg",
-                 sensor.rollDeciDegrees / 10.0F,
-                 sensor.pitchDeciDegrees / 10.0F);
-        display.drawString(row, 4, 140, 2);
-    } else {
-        display.setTextColor(TFT_ORANGE, TFT_BLACK);
-        display.drawString("N2 LSM303AGR: no valid data", 4, 89, 2);
-    }
-
+    display.drawFastHLine(0, 176, screenWidth(), TFT_DARKGREY);
     display.setTextColor(TFT_YELLOW, TFT_BLACK);
-    display.drawString("Event log", 4, 160, 2);
-    display.drawFastHLine(0, 177, screenWidth(), TFT_DARKGREY);
+    display.drawString("Events / sensor-frame XYZ and MAE", 4, 180, 1);
     display.setTextColor(TFT_CYAN, TFT_BLACK);
-    for (int line = 0; line < EventLogLineCount; ++line) {
-        if (eventLog[line][0] != '\0') {
-            display.drawString(eventLog[line], 4, 181 + line * 15, 2);
-        }
-    }
+    for (int line = 0; line < EventLogLineCount; ++line)
+        display.drawString(eventLog[line], 4, 192+line*11, 1);
 }
 
 void redrawDisplay() {
@@ -453,8 +468,8 @@ void refreshNodeFreshness(uint32_t nowMs) {
     for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
         const int index = nodeIndex(nodeId);
         NodeStatus& status = nodeStatus[index];
-        const bool linkChanged = status.link.update(nowMs, NodeOfflineMs);
-        const bool sensorChanged = status.sensor.update(nowMs, SensorOfflineMs);
+        const bool linkChanged = status.link.update(nowMs, linkTimeout(status.mode));
+        const bool sensorChanged = status.sensor.update(nowMs, status.mode == ReportingMode::Quiet ? 90000 : status.mode == ReportingMode::Normal ? 25000 : SensorOfflineMs);
         if (linkChanged || sensorChanged) {
             nodeCardDirty[index] = true;
             debugDirty = true;
@@ -480,6 +495,7 @@ void onDataReceived(const uint8_t* sourceMac,
         return;
     }
     ReceivedPacket& received = receiveQueue[receiveQueueWriteIndex];
+    received.receivedMs = uint64_t(esp_timer_get_time())/1000;
     memcpy(received.payload, data, dataLength);
     received.payloadLength = static_cast<uint8_t>(dataLength);
     memcpy(received.sourceMac, sourceMac, sizeof(received.sourceMac));
@@ -518,7 +534,7 @@ void sendPacket(uint8_t nodeId,
                 CommandType command = CommandType::None,
                 int16_t commandValue = NoAzimuthDeciDegrees,
                 uint32_t commandEpochSeconds = 0) {
-    const Packet packet{
+    Packet packet{
         static_cast<uint8_t>(packetType),
         static_cast<uint8_t>(DeviceId::CydGateway),
         ProtocolVersion,
@@ -531,6 +547,7 @@ void sendPacket(uint8_t nodeId,
         commandValue,
         static_cast<uint8_t>(command),
         latestRssiForNode(nodeId)};
+    packet.utcMilliseconds = utcMilliseconds();
     const esp_err_t result =
         esp_now_send(antennaNodeMac(nodeId),
                      reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
@@ -541,10 +558,25 @@ void sendPacket(uint8_t nodeId,
                   result == ESP_OK ? "queued" : "failed");
 }
 
-void sendTimeSync() {
+void sendTimeSync(bool force = false) {
+    if (!timeValid) return;
     for (uint8_t nodeId = 1; nodeId <= AntennaNodeCount; ++nodeId) {
-        sendPacket(nodeId, PacketType::TimeSync);
+        auto& status = nodeStatus[nodeIndex(nodeId)];
+        const uint32_t period = status.mode == ReportingMode::Quiet ? 60000 :
+                                status.mode == ReportingMode::Continuous ? 3000 : 10000;
+        if (force || millis()-status.lastTimeSyncMs >= period) {
+            sendPacket(nodeId, PacketType::TimeSync);
+            status.lastTimeSyncMs = millis();
+        }
     }
+}
+
+void emitGatewayStatus() {
+    JsonDocument doc;
+    doc["t"] = "gs"; doc["ts_ms"] = utcMilliseconds(); doc["tv"] = timeValid;
+    doc["up_ms"] = millis(); doc["sync_age_ms"] = utcClock.syncAge(uint64_t(esp_timer_get_time())/1000);
+    doc["sync_step_ms"] = utcClock.correctionMs; doc["pv"] = ProtocolVersion;
+    emitJsonFrame(doc);
 }
 
 void sendCommand(uint8_t nodeId,
@@ -560,47 +592,10 @@ void sendCommand(uint8_t nodeId,
     appendEvent("TX N%u cmd %u", nodeId, static_cast<uint8_t>(command));
 }
 
-void emitStatusJson(const Packet& packet) {
-    Serial.printf(
-        "{\"t\":\"rp\",\"n\":%u,\"q\":%lu,\"ts\":%lu,\"h\":%.1f,"
-        "\"tg\":",
-        packet.senderId, static_cast<unsigned long>(packet.sequence),
-        static_cast<unsigned long>(packet.epochSeconds),
-        packet.azimuthDeciDegrees / 10.0F);
-    if (packet.targetDeciDegrees == NoAzimuthDeciDegrees) {
-        Serial.print("null");
-    } else {
-        Serial.printf("%.1f", packet.targetDeciDegrees / 10.0F);
-    }
-    Serial.printf(
-        ",\"mv\":%u,\"e\":0,\"ack\":%u,\"rg\":%d,\"rn\":%d,"
-        "\"src\":\"espnow\"}\n",
-        hasFlag(packet.flags, StatusFlag::Moving) ? 1U : 0U,
-        packet.packetType ==
-                static_cast<uint8_t>(PacketType::CommandAcknowledgment)
-            ? static_cast<unsigned int>(packet.commandType)
-            : 0U,
-        latestRssiForNode(packet.senderId), packet.receiverRssiDbm);
+void emitStatusJson(const Packet& packet, uint64_t receivedMs) {
+    emitRuntimeStatus(packet, "espnow", utcClock.at(receivedMs), latestRssiForNode(packet.senderId));
 }
-
-void emitSensorJson(const SensorTelemetry& telemetry) {
-    const float x = telemetry.magneticXDeciMicrotesla / 10.0F;
-    const float y = telemetry.magneticYDeciMicrotesla / 10.0F;
-    const float z = telemetry.magneticZDeciMicrotesla / 10.0F;
-    Serial.printf(
-        "{\"t\":\"rs\",\"n\":%u,\"q\":%lu,\"mh\":%.1f,"
-        "\"m\":[%.1f,%.1f,%.1f],\"a\":[%.3f,%.3f,%.3f],"
-        "\"f\":%.1f,\"r\":%.1f,\"p\":%.1f,\"sf\":%u,"
-        "\"src\":\"espnow\"}\n",
-        telemetry.senderId, static_cast<unsigned long>(telemetry.sequence),
-        telemetry.magneticHeadingDeciDegrees / 10.0F, x, y, z,
-        telemetry.accelerationXMilliG / 1000.0F,
-        telemetry.accelerationYMilliG / 1000.0F,
-        telemetry.accelerationZMilliG / 1000.0F,
-        sqrtf(x * x + y * y + z * z),
-        telemetry.rollDeciDegrees / 10.0F,
-        telemetry.pitchDeciDegrees / 10.0F, telemetry.flags);
-}
+void emitSensorJson(const SensorTelemetry& telemetry) { emitRawSensor(telemetry, "espnow"); }
 
 void processReceivedPackets() {
     while (receiveQueueReadIndex != receiveQueueWriteIndex) {
@@ -648,6 +643,7 @@ void processReceivedPackets() {
             sensorStatus.rollDeciDegrees = telemetry.rollDeciDegrees;
             sensorStatus.pitchDeciDegrees = telemetry.pitchDeciDegrees;
             sensorStatus.sensor.receive(millis());
+            sensorStatus.hasSensorSample = true;
             sensorStatus.link.receive(millis());
 
             const float x = telemetry.magneticXDeciMicrotesla / 10.0F;
@@ -683,7 +679,8 @@ void processReceivedPackets() {
         }
         if (packet.packetType != static_cast<uint8_t>(PacketType::Status) &&
             packet.packetType !=
-                static_cast<uint8_t>(PacketType::CommandAcknowledgment)) {
+                static_cast<uint8_t>(PacketType::CommandAcknowledgment) &&
+            packet.packetType != static_cast<uint8_t>(PacketType::ReportingAcknowledgment)) {
             continue;
         }
 
@@ -692,6 +689,10 @@ void processReceivedPackets() {
         status.targetDeciDegrees = packet.targetDeciDegrees;
         status.flags = packet.flags;
         status.nodeEpochSeconds = packet.epochSeconds;
+        status.nodeUtcMs = packet.utcMilliseconds;
+        if (packet.reportingMode <= 2) status.mode = ReportingMode(packet.reportingMode);
+        status.quietRemainingMs = packet.quietRemainingMs;
+        status.lastModeMs = millis();
         status.link.receive(millis());
         const int8_t rssiAtGateway = latestRssiForNode(packet.senderId);
         if (rssiAtGateway != RssiUnavailable) {
@@ -710,7 +711,7 @@ void processReceivedPackets() {
                           ? -1.0F
                           : packet.targetDeciDegrees / 10.0F,
                       packet.flags);
-        emitStatusJson(packet);
+        emitStatusJson(packet, received.receivedMs);
         if (activePanel == Panel::Home) {
             nodeCardDirty[index] = true;
         } else if (activePanel == Panel::Debug) {
@@ -830,6 +831,19 @@ void keypadKey(const char* key) {
 
 void handleSerialLine(char* line) {
     if (line[0] == '{') {
+        uint64_t utcMs = 0;
+        if (parseClockCommand(line, &utcMs)) {
+            const bool firstSync = !timeValid;
+            setEpochMs(utcMs);
+            if (firstSync) sendTimeSync(true);
+            emitGatewayStatus();
+            return;
+        }
+        ReportingCommand reportingCommand{};
+        if (parseReportingCommand(line, &reportingCommand)) {
+            esp_now_send(antennaNodeMac(reportingCommand.node), reinterpret_cast<const uint8_t*>(&reportingCommand), sizeof(reportingCommand));
+            return;
+        }
         CalibrationCommand calibrationCommand{};
         if (parseCalibrationCommand(line, &calibrationCommand)) {
             const esp_err_t result = esp_now_send(antennaNodeMac(calibrationCommand.node),
@@ -846,7 +860,7 @@ void handleSerialLine(char* line) {
         }
         if (serialCommand.command == CommandType::None) {
             setEpoch(serialCommand.executeAtEpochSeconds);
-            sendTimeSync();
+            sendTimeSync(true);
         } else {
             sendCommand(
                 serialCommand.nodeId, serialCommand.command,
@@ -874,7 +888,7 @@ void handleSerialLine(char* line) {
         uint32_t epochSeconds = 0;
         if (parseTimestamp(timestamp, &epochSeconds)) {
             setEpoch(epochSeconds);
-            sendTimeSync();
+            sendTimeSync(true);
             Serial.printf("TIME set to %lu UTC seconds\n",
                           static_cast<unsigned long>(epochSeconds));
         } else {
@@ -1238,9 +1252,10 @@ void loop() {
 
     const uint32_t nowMs = millis();
     refreshNodeFreshness(nowMs);
-    if (nowMs >= nextTimeSyncMs) {
-        sendTimeSync();
-        nextTimeSyncMs = nowMs + TimeSyncPeriodMs;
+    sendTimeSync();
+    if (nowMs-lastGatewayReportMs >= 1000) {
+        lastGatewayReportMs = nowMs;
+        emitGatewayStatus();
     }
     const uint32_t nowEpoch = epochNow();
     if (nowEpoch != lastUiClockSecond) {

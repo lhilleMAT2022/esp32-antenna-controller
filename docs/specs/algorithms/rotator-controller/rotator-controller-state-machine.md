@@ -1,5 +1,10 @@
 # Rotator Controller v0.1 — State-Machine Contract
 
+Runtime update (2026-10-07): [Node reporting and timing](../../../node-runtime.md)
+specifies the current continuous/normal/quiet states, >10° unexpected motion,
+quiet timer and movement exceptions, clocks, protocol 4, and verification.
+It supersedes fixed telemetry rates in this original rotator-model document.
+
 ## Status: Draft
 
 **Last updated:** 2026-09-28  

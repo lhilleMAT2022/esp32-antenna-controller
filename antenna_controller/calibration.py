@@ -172,6 +172,7 @@ class Capture:
     capture_path: Path | None = None
     last_archive: Path | None = None
     archive_error: str = ""
+    timeout_s: float = 3.5
 
 
 class CalibrationManager:
@@ -266,7 +267,7 @@ class CalibrationManager:
                 return
             if message.get("t") != "rs" or not state.mode:
                 return
-            if time.monotonic() - state.seen > 3.5:
+            if time.monotonic() - state.seen > state.timeout_s:
                 state.note = "Waiting for fresh calibration telemetry"
                 return
             seq = message.get("q")
@@ -298,12 +299,28 @@ class CalibrationManager:
                 state.note = f"Tumble ALL axes: {len(state.samples)}/120 minimum samples; then cal {node} fit mag"
             self._archive(node, "capture", path=state.capture_path)
 
+    def observe_runtime(self, message: dict[str, Any], timeout_s: float) -> None:
+        node = message.get("n")
+        if node not in self.nodes or not all(k in message for k in ("boot", "q", "cf")):
+            return
+        with self.lock:
+            state = self.nodes[node]
+            state.timeout_s = timeout_s
+            # Heartbeats carry current calibration flags even when quiet mode
+            # suppresses corrected-vector reports. Do not invent a new heading.
+            report = dict(state.status)
+            report.update(t="cs", n=node, boot=message["boot"], q=message["q"],
+                          cf=message["cf"], req=0, e=0)
+            if message["boot"] != state.boot:
+                report.pop("ch", None)
+            self.ingest(report)
+
     def describe(self, node: int) -> str:
         with self.lock:
             s = self.nodes[node]
             self._expire(node)
             note = s.note + ("\n" + s.archive_error if s.archive_error else "")
-            if not s.seen or time.monotonic()-s.seen > 3.5:
+            if not s.seen or time.monotonic()-s.seen > s.timeout_s:
                 return "CALIBRATION UNKNOWN / STALE\n" + note
             flags = int(s.status.get("cf", 0))
             parts = [f"{label}: {'yes' if flags & bit else 'no'}" for bit, label in ((1, 'mag'), (2, 'accel'), (4, 'mount'))]
@@ -344,7 +361,7 @@ class CalibrationManager:
                 return s.note
             if action == "status" and not args:
                 return self._request(node, "status", [])
-            if not s.seen or time.monotonic()-s.seen > 3.5:
+            if not s.seen or time.monotonic()-s.seen > s.timeout_s:
                 raise ValueError("No fresh calibration status; update node and gateway firmware, then request status")
             if s.pending:
                 raise ValueError("Waiting for node confirmation; do not send another calibration operation")

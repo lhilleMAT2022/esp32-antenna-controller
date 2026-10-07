@@ -1,5 +1,13 @@
 # Node sensor calibration
 
+The Calibration tab now displays both nodes simultaneously, including raw
+XYZ and MAE vectors and sample age. MAE angles describe the sensor frame,
+not true antenna bearing. `cal <node> start mag` and `cal <node> face <face>`
+automatically request continuous reporting for both nodes and wait for both
+acknowledgments before capturing. A failure or timeout prevents capture from
+starting. Cancel capture before requesting normal or quiet; finishing a
+capture leaves continuous enabled. See [runtime](node-runtime.md).
+
 The host fits calibration from raw telemetry. Both sensor-equipped remote
 nodes apply their own coefficients and can save them in ESP32 Preferences/NVS
 flash. A reboot reloads the saved

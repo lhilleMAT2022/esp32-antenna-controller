@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -14,9 +15,11 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import ModalScreen
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane
 from textual_plotext import PlotextPlot
+
+from .runtime import utc_text, vector_text
 
 if TYPE_CHECKING:
     from .bridge import AntennaController, NodeState
@@ -90,6 +93,45 @@ class CalibrationHelp(ModalScreen):
         self.dismiss()
 
 
+class ReportingDialog(ModalScreen):
+    BINDINGS = [("escape", "close", "Close")]
+    DEFAULT_CSS = """
+    ReportingDialog { align: center middle; }
+    #reporting-dialog { width: 70; height: auto; padding: 1 2; border: thick #168aad; background: #06334b; }
+    #reporting-dialog Horizontal { height: 3; }
+    """
+
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+
+    def compose(self):
+        with Vertical(id="reporting-dialog"):
+            yield Static("[bold]Reporting mode — both nodes[/]\nContinuous: 1 Hz. Normal: 10 s, faster during motion.\nQuiet: 60 s heartbeat; duration required.")
+            yield Input(value="300", placeholder="Quiet duration in seconds (1..86400)", id="quiet-seconds")
+            with Horizontal():
+                yield Button("Continuous", id="mode-continuous")
+                yield Button("Normal", id="mode-normal")
+                yield Button("Quiet", id="mode-quiet")
+
+    @on(Button.Pressed)
+    def apply_mode(self, event):
+        if not event.button.id or not event.button.id.startswith("mode-"):
+            return
+        mode = event.button.id.removeprefix("mode-")
+        try:
+            seconds = int(self.query_one("#quiet-seconds", Input).value) if mode == "quiet" else 0
+            result = self.controller.set_reporting_mode(mode, seconds)
+        except (ValueError, RuntimeError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(result)
+        self.dismiss()
+
+    def action_close(self):
+        self.dismiss()
+
+
 @dataclass
 class HistorySample:
     monotonic_s: float
@@ -156,7 +198,8 @@ class AntennaControllerApp(App[None]):
     }
 
     #node-health {
-        height: 2fr;
+        height: auto;
+        min-height: 10;
     }
 
     #heartbeats {
@@ -164,7 +207,7 @@ class AntennaControllerApp(App[None]):
     }
 
     #calibration {
-        height: 1fr;
+        height: auto;
     }
 
     #health-tabs {
@@ -272,10 +315,12 @@ class AntennaControllerApp(App[None]):
             with Vertical(id="health-column"):
                 with TabbedContent(id="health-tabs"):
                     with TabPane("Health", id="health-tab"):
-                        yield Static(id="node-health", classes="panel")
-                        yield Static(id="heartbeats", classes="panel")
+                        with VerticalScroll():
+                            yield Static(id="node-health", classes="panel")
+                            yield Static(id="heartbeats", classes="panel")
                     with TabPane("Calibration", id="calibration-tab"):
-                        yield Static(id="calibration", classes="panel")
+                        with VerticalScroll():
+                            yield Static(id="calibration", classes="panel")
             yield RichLog(id="raw-log", markup=True, wrap=False, highlight=False)
         with Horizontal(id="command-bar"):
             yield Input(
@@ -286,6 +331,7 @@ class AntennaControllerApp(App[None]):
             )
             yield Button("SEND", id="send-command", variant="primary")
             yield Button("Cal", id="cal-help-button")
+            yield Button("Reporting", id="reporting-button")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -315,8 +361,7 @@ class AntennaControllerApp(App[None]):
     def _update_status(self, states: list["NodeState"]) -> None:
         now_ms = int(time.time() * 1000)
         online_nodes = sum(
-            state.measured_utc_ms > 0
-            and now_ms - state.measured_utc_ms < 5000
+            any(self.controller.states.route_fresh(state.node_id, route) for route in ("gateway", "backup"))
             for state in states
         )
         serial_ok = self.controller.primary.connected.is_set()
@@ -353,48 +398,40 @@ class AntennaControllerApp(App[None]):
         self.query_one("#status-bar", Static).update(text)
 
     def _update_health(self, states: list["NodeState"]) -> None:
-        lines = ["[bold cyan]NODE STATUS / GEOMETRY[/]"]
-        now_ms = int(time.time() * 1000)
+        lines = ["[bold cyan]NODE HEALTH / REPORTING / UTC[/]"]
+        gateway = self.controller.gateway_status
+        lines.append(f"PC {utc_text(int(time.time()*1000))}")
+        gateway_ms = gateway.get("ts_ms")
+        if gateway_ms:
+            delta = gateway_ms-gateway["received_utc_ms"]
+            age = time.monotonic()-gateway["received_monotonic"]
+            lines.append(f"CYD {utc_text(gateway_ms)}  ΔPC {delta:+.0f} ms (age {age:.1f}s)")
+        else:
+            lines.append("CYD UTC: awaiting synchronized gateway report")
         for state in states:
-            age = (
-                None
-                if not state.measured_utc_ms
-                else max(0.0, (now_ms - state.measured_utc_ms) / 1000.0)
-            )
-            age_text = "---" if age is None else f"{age:4.1f}s"
-            heading = "---" if state.heading_deg is None else f"{state.heading_deg:6.1f}°"
-            target = "---" if state.target_deg is None else f"{state.target_deg:6.1f}°"
-            routes = [
-                label
-                for label, route in (("ESP-NOW", "gateway"), ("PI", "backup"))
-                if self.controller.states.route_fresh(state.node_id, route)
-            ]
-            route_text = "+".join(routes) if routes else "NONE"
-            rssi = (
-                "---"
-                if state.rssi_at_gateway_dbm is None
-                else f"{state.rssi_at_gateway_dbm:.0f} dBm"
-            )
-            condition = (
-                "[green]TRACKING[/]"
-                if state.moving
-                else "[green]LOCKED[/]"
-                if age is not None and age < 5
-                else "[red]LOST[/]"
-            )
-            lines.extend(
-                [
-                    f"[bold]Node {state.node_id}[/]  {condition}  "
-                    f"last={age_text}  route={route_text}",
-                    f"  Heading {heading}   Target {target}   RSSI {rssi}",
-                ]
-            )
-        n1 = states[0].heading_deg
-        n2 = states[1].heading_deg
-        lines.append(
-            "[dim]Geometry[/]  "
-            f"N1 {self._arrow(n1)}  •  {self._arrow(n2)} N2"
-        )
+            routes = [label for label, route in (("ESP-NOW", "gateway"), ("PI", "backup"))
+                      if self.controller.states.route_fresh(state.node_id, route)]
+            condition = "[green]MOVING[/]" if routes and state.moving else "[green]ONLINE[/]" if routes else "[red]LOST[/]"
+            mode = state.reporting_mode
+            if mode == "quiet":
+                left = max(0, math.ceil(state.quiet_remaining_ms/1000 - (time.monotonic()-state.report_received_monotonic)))
+                mode += f" [{left}s left]" + (" awaiting report" if not left else "")
+            heading = "—" if state.heading_deg is None else f"{state.heading_deg:.1f}°"
+            target = "—" if state.target_deg is None else f"{state.target_deg:.1f}°"
+            age = time.monotonic()-state.report_received_monotonic if state.report_received_monotonic else None
+            age_text = "—" if age is None else f"{age:.1f}s"
+            def ms(value):
+                return "—" if value is None else f"{value:+.1f}"
+            lines.extend([
+                f"[bold]Node {state.node_id}[/] {condition}  [yellow]{mode}[/]",
+                f"  Az {heading} → {target} | {'+'.join(routes) or 'NONE'} | RSSI {ms(state.rssi_at_gateway_dbm)} dBm",
+                f"  UTC {utc_text(state.node_utc_ms)} (sample age {age_text})",
+                f"  ΔCYD {ms(state.node_cyd_offset_ms)} ms  σ {ms(state.cyd_jitter_ms)} ms | ΔPC {ms(state.node_pc_offset_ms)} ms",
+                f"  Sync age {('—' if state.sync_age_ms is None else f'{state.sync_age_ms/1000:.1f}s')} | last correction {ms(state.sync_step_ms)} ms",
+            ])
+        if self.controller.reporting.results:
+            lines.append(escape(self.controller.reporting.describe()))
+        lines.append("[dim]Δ measured at receipt; σ over last 60 reports includes link jitter[/]")
         self.query_one("#node-health", Static).update("\n".join(lines))
 
     def _update_heartbeats(self) -> None:
@@ -410,19 +447,20 @@ class AntennaControllerApp(App[None]):
         self.query_one("#heartbeats", Static).update("\n".join(lines))
 
     def _update_calibration(self, states: list["NodeState"]) -> None:
-        node_id = self.calibration_node
-        sensor = states[node_id - 1]
-        magnetic = self._vector_text(sensor.magnetic_ut, 1, "µT")
-        acceleration = self._vector_text(sensor.acceleration_g, 3, "g")
-        status = escape(self.controller.calibration.describe(node_id))
-        self.query_one("#calibration", Static).update(
-            f"[bold cyan]N{node_id} SENSOR / CALIBRATION[/]  "
-            + status
-            + "\n"
-            + f"Bxyz {magnetic}\n"
-            + f"Axyz {acceleration}\n"
-            + f"[dim]Select Node 1/2 above | c: instructions | cal {node_id} status[/]"
-        )
+        lines = []
+        for sensor in states:
+            node = sensor.node_id
+            status = escape(self.controller.calibration.describe(node))
+            age = time.monotonic()-sensor.sensor_received_monotonic if sensor.sensor_received_monotonic else None
+            lines.extend([
+                f"[bold cyan]N{node} SENSOR / CALIBRATION[/]  " + status,
+                "B " + vector_text(sensor.magnetic_ut if sensor.sensor_flags & 8 else None, 1, "µT"),
+                "A " + vector_text(sensor.acceleration_g if sensor.sensor_flags & 4 else None, 3, "g"),
+                f"[dim]Raw sample age {('—' if age is None else f'{age:.1f}s')} | cal {node} status[/]",
+                "",
+            ])
+        lines.append("[dim]MAE: magnitude, sensor-frame azimuth (+X toward +Y), elevation above XY[/]")
+        self.query_one("#calibration", Static).update("\n".join(lines))
 
     def _update_events(self) -> None:
         log = self.query_one("#raw-log", RichLog)
@@ -617,7 +655,9 @@ class AntennaControllerApp(App[None]):
             if len(fields) >= 2 and fields[1] in ("1", "2"):
                 self.calibration_node = int(fields[1])
             self.query_one("#health-tabs", TabbedContent).active = "calibration-tab"
-            return self.controller.calibration.command(fields[1:])
+            return self.controller.calibration_command(fields[1:])
+        if fields[0] in ("report", "reporting") and len(fields) in (2, 3):
+            return self.controller.set_reporting_mode(fields[1], int(fields[2]) if len(fields) == 3 else 0)
         if fields[0] == "goto" and len(fields) == 3:
             route = self.controller._send_rotator_command(
                 int(fields[1]), "goto", azimuth_deg=float(fields[2])
@@ -684,6 +724,10 @@ class AntennaControllerApp(App[None]):
     def action_calibration_help(self) -> None:
         self.query_one("#health-tabs", TabbedContent).active = "calibration-tab"
         self.push_screen(CalibrationHelp(self.calibration_node))
+
+    @on(Button.Pressed, "#reporting-button")
+    def action_reporting(self) -> None:
+        self.push_screen(ReportingDialog(self.controller))
 
     def action_step_node(self, node_id: int, delta_deg: float) -> None:
         try:
