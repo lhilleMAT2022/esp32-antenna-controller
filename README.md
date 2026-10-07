@@ -32,8 +32,11 @@ models; physical antenna control and field acceptance are still pending.
   performance, exercise communication loss/recovery, and validate reporting
   modes—including silent operation—during RF collections. Record the final
   wiring, operating procedure, and field acceptance evidence.
+- [ ] **Evaluate cleaner antenna power (deferred; separate investigation).**
+  At the next antenna-site visit, test the available power bricks for reducing
+  60 Hz interference, including DC during reception and AC during rotation.
 
-Version **1.0** is reached when all three milestones are completed and their
+Version **1.0** is reached when all four milestones are completed and their
 hardware acceptance results are recorded.
 
 ## Current development snapshot — 2026-10-07
