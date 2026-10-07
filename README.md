@@ -8,6 +8,34 @@ rotator-mounted Yagis. Its intended implementation comprises a Cheap Yellow
 Display (CYD) USB gateway and local operator console, two ESP32 antenna nodes
 connected over ESP-NOW, node firmware, and a host-side control adapter.
 
+## Version 0.9
+
+Git tag **v0.9** marks the software and bench-tested firmware checkpoint.
+The Python package version is **0.9.0**; the wire protocol remains **7**.
+The host TUI, command recording/replay, scheduled slews, and reporting modes
+are implemented. All three boards are deployed, 75 regression tests pass,
+and the silent-mode bench check passes. Motion currently uses non-actuating
+models; physical antenna control and field acceptance are still pending.
+
+## Remaining work for version 1.0
+
+- [ ] **Verify calibration on both nodes.** Complete magnetometer and
+  six-face accelerometer calibration, apply and save corrections, verify
+  persistence after a power cycle, and check mounting alignment and heading
+  against known bearings. Retain captures and acceptance results.
+- [ ] **Connect and implement the [Adafruit STEMMA relay (4409)](http://adafru.it/4409).**
+  Wire the relay contacts across the antenna controller's buttons, implement
+  physical button actuation, and verify press/release timing, direction changes,
+  stop behavior, and released contacts at startup before exercising full moves.
+- [ ] **Integrate the complete hardware and test in the field.** Test both
+  antennas through immediate and scheduled moves, verify pointing and holding
+  performance, exercise communication loss/recovery, and validate reporting
+  modes—including silent operation—during RF collections. Record the final
+  wiring, operating procedure, and field acceptance evidence.
+
+Version **1.0** is reached when all three milestones are completed and their
+hardware acceptance results are recorded.
+
 ## Current development snapshot — 2026-10-07
 
 Protocol **7** adds `report silent <seconds>`: remote nodes execute moves and

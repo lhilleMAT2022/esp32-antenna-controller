@@ -1,6 +1,6 @@
 [project]
 name = "antenna-controller"
-version = "0.2.0"
+version = "0.9.0"
 description = "Host Antenna Controller and remote-node serial relay"
 requires-python = ">=3.10"
 dependencies = [

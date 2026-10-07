@@ -9,7 +9,7 @@ resolution-markers = [
 
 [[package]]
 name = "antenna-controller"
-version = "0.2.0"
+version = "0.9.0"
 source = { virtual = "." }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://mw-python-repository.mathworks.com/artifactory/api/pypi/pypi-repos/simple" }, marker = "python_full_version < '3.11'" },
